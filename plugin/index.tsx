@@ -1,5 +1,6 @@
 import { ApplicationCommandInputType, ApplicationCommandOptionType, sendBotMessage } from "@api/Commands";
 import { addMessagePreSendListener, removeMessagePreSendListener } from "@api/MessageEvents";
+import * as Notices from "@api/Notices";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 import { DataStore } from "@api/index";
@@ -41,6 +42,28 @@ async function getCloudSharedProfile(discordId: string): Promise<{ trade_url?: s
         cloudProfileCache.set(discordId, { data: null, ts: Date.now() });
         return null;
     }
+}
+
+async function maybePromptForTradeUrl(): Promise<void> {
+    // Only prompt if cloud share is on AND user hasn't set a trade URL yet AND we haven't shown it before.
+    if (!settings.store.shareViaCloud) return;
+    if (settings.store.tradeUrl?.trim()) return;
+    const shown = await DataStore.get("vsi.tradePromptShown");
+    if (shown) return;
+
+    // Delay so the notice appears after Vencord finishes booting.
+    setTimeout(() => {
+        try {
+            Notices.showNotice(
+                "💼 Steam Inventory Value: paste your Steam trade URL into the plugin settings to publish it and see friends' trade offers.",
+                "Open Settings",
+                () => {
+                    Notices.popNotice();
+                    DataStore.set("vsi.tradePromptShown", true).catch(() => { });
+                },
+            );
+        } catch (e) { console.warn("[VSI] notice failed", e); }
+    }, 8000);
 }
 
 let lastPublishHash = "";
@@ -145,8 +168,8 @@ const settings = definePluginSettings({
     },
     shareViaCloud: {
         type: OptionType.BOOLEAN,
-        description: "Publish your trade URL / Steam profile to the vsi-share cloud so other plugin users see them on your Discord popout. Off by default.",
-        default: false,
+        description: "Publish your trade URL / Steam profile to the vsi-share cloud so other plugin users see them on your Discord popout. On by default — set your trade URL below to publish it.",
+        default: true,
     },
     shareWorkerUrl: {
         type: OptionType.STRING,
@@ -1277,7 +1300,9 @@ const linkStyle: React.CSSProperties = {
     userSelect: "none",
 };
 
-const AboutComponent: React.FC = () => (
+const AboutComponent: React.FC = () => {
+    const tradeUrlSet = !!settings.store.tradeUrl?.trim();
+    return (<>
     <div style={{
         position: "relative",
         display: "flex",
@@ -1285,7 +1310,7 @@ const AboutComponent: React.FC = () => (
         justifyContent: "space-between",
         gap: 16,
         padding: "12px 14px",
-        marginBottom: 16,
+        marginBottom: tradeUrlSet ? 16 : 10,
         borderRadius: 10,
         background: "linear-gradient(180deg, rgba(88,101,242,.10) 0%, rgba(255,255,255,.02) 100%)",
         border: "1px solid rgba(88,101,242,.28)",
@@ -1349,7 +1374,34 @@ const AboutComponent: React.FC = () => (
             />
         </div>
     </div>
-);
+    {!tradeUrlSet && (
+        <div style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            padding: "10px 14px",
+            marginBottom: 16,
+            borderRadius: 10,
+            background: "linear-gradient(180deg, rgba(240,178,42,.10) 0%, rgba(240,178,42,.03) 100%)",
+            border: "1px solid rgba(240,178,42,.30)",
+        }}>
+            <span style={{ fontSize: 18, lineHeight: 1 }}>🎯</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#f0b22a", marginBottom: 2 }}>
+                    Set your trade URL to publish it
+                </div>
+                <Forms.FormText style={{ fontSize: 11.5, lineHeight: 1.4, color: "var(--text-muted)" }}>
+                    Cloud share is on — but without a trade URL there's nothing to publish. Grab your URL from{" "}
+                    <a href="https://steamcommunity.com/my/tradeoffers/privacy" target="_blank" rel="noopener noreferrer" style={{ color: "#f0b22a", textDecoration: "underline" }}>
+                        steamcommunity.com/my/tradeoffers/privacy
+                    </a>{" "}
+                    and paste it into the <b>Trade URL</b> field below.
+                </Forms.FormText>
+            </div>
+        </div>
+    )}
+    </>);
+};
 
 // ─── Plugin definition ────────────────────────────────────────────────────────
 
@@ -1369,6 +1421,9 @@ export default definePlugin({
         publishTimeout = setTimeout(() => { publishSharedProfile().catch(e => console.warn("[VSI] initial publish", e)); }, 5000);
         // Also re-publish every 15 minutes so setting changes propagate without a Discord restart.
         publishInterval = setInterval(() => { publishSharedProfile().catch(() => {}); }, 15 * 60 * 1000);
+
+        // Prompt for trade URL on first run (once) so users know cloud share needs it.
+        maybePromptForTradeUrl().catch(() => {});
 
         // Intercept "/csinv <ref>" typed in any channel — resolves + prices before Discord sends.
         preSendListener = async (channelId: string, message: any) => {
