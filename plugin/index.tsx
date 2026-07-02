@@ -3,7 +3,7 @@ import { addMessagePreSendListener, removeMessagePreSendListener } from "@api/Me
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 import { DataStore } from "@api/index";
-import { MessageActions, RestAPI, UserProfileStore, UserStore } from "@webpack/common";
+import { Forms, MessageActions, React, RestAPI, UserProfileStore, UserStore } from "@webpack/common";
 
 // Discord's CSP blocks fetch() to non-whitelisted hosts (steamcommunity.com, csfloat.com, etc.).
 // Route all external calls through Vencord's native (Electron main-process) helper, which is CSP-free.
@@ -870,6 +870,8 @@ let observer: MutationObserver | null = null;
 // Set by the commands closure at module load — allows the preSend listener to invoke the same pipeline.
 let csInvExec: ((ref: string, channelId: string) => Promise<void>) | null = null;
 let preSendListener: ((channelId: string, message: any) => Promise<void | { cancel: boolean }>) | null = null;
+let publishTimeout: ReturnType<typeof setTimeout> | null = null;
+let publishInterval: ReturnType<typeof setInterval> | null = null;
 
 function ensureStyle() {
     if (styleEl) return;
@@ -1248,6 +1250,107 @@ function startObserver() {
     scan(document.body);
 }
 
+// ─── Settings header ─────────────────────────────────────────────────────────
+
+const GITHUB_URL = "https://github.com/VisaHolder/steam-inventory-value";
+const AUTHOR_STEAM_URL = "https://steamcommunity.com/profiles/76561199109828420";
+
+const GITHUB_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1.1-.8.1-.8.1-.8 1.2 0 1.9 1.3 1.9 1.3 1.1 1.9 3 1.3 3.7 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.4-5.5-6 0-1.3.5-2.4 1.3-3.2 0-.4-.6-1.6.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.7 1.6.2 2.9.1 3.2.8.9 1.3 2 1.3 3.3 0 4.6-2.8 5.6-5.5 5.9.5.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3"/></svg>`;
+const STEAM_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M11.98 2C6.7 2 2.36 6.03 2 11.13l5.38 2.22a2.86 2.86 0 0 1 1.6-.48h.15l2.4-3.47v-.05a3.83 3.83 0 1 1 3.83 3.83h-.09l-3.42 2.44v.13a2.87 2.87 0 0 1-5.42 1.3L2.5 15.5A9.99 9.99 0 0 0 22 12c0-5.52-4.48-10-10.02-10ZM8.79 17.16l-1.22-.5a2.16 2.16 0 0 0 1.15 1.13c1.09.45 2.35-.06 2.8-1.16.22-.53.22-1.11 0-1.64a2.15 2.15 0 0 0-1.14-1.16 2.14 2.14 0 0 0-1.64.01l1.26.52a1.59 1.59 0 1 1-1.21 2.94v-.14Zm10.02-7.6a2.55 2.55 0 0 1-5.11 0 2.55 2.55 0 0 1 5.11 0Zm-4.47 0a1.92 1.92 0 1 0 3.83 0 1.92 1.92 0 0 0-3.83 0Z"/></svg>`;
+
+const linkStyle: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "7px 12px",
+    borderRadius: 8,
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: 0.2,
+    textDecoration: "none",
+    color: "var(--text-normal)",
+    background: "linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02))",
+    border: "1px solid rgba(255,255,255,.08)",
+    boxShadow: "0 1px 0 rgba(255,255,255,.06) inset, 0 1px 2px rgba(0,0,0,.2)",
+    transition: "background 120ms ease, transform 120ms ease, border-color 120ms ease",
+    cursor: "pointer",
+    userSelect: "none",
+};
+
+const AboutComponent: React.FC = () => (
+    <div style={{
+        position: "relative",
+        display: "flex",
+        alignItems: "flex-start",
+        justifyContent: "space-between",
+        gap: 16,
+        padding: "12px 14px",
+        marginBottom: 16,
+        borderRadius: 10,
+        background: "linear-gradient(180deg, rgba(88,101,242,.10) 0%, rgba(255,255,255,.02) 100%)",
+        border: "1px solid rgba(88,101,242,.28)",
+        boxShadow: "0 1px 0 rgba(255,255,255,.05) inset, 0 4px 14px rgba(88,101,242,.10)",
+    }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontSize: 15,
+                fontWeight: 700,
+                color: "var(--header-primary)",
+                marginBottom: 4,
+                letterSpacing: 0.1,
+            }}>
+                <span style={{ fontSize: 16 }}>💼</span>
+                Steam Inventory Value
+            </div>
+            <Forms.FormText style={{ fontSize: 12.5, lineHeight: 1.45, color: "var(--text-muted)" }}>
+                CS2 inventory value + Trade / Steam buttons on Discord profile popouts.
+                Ephemeral rich embed or public markdown for <code>/inventory</code>, plus <code>/csinv &lt;ref&gt;</code>
+                for any Steam profile — SteamID64, vanity, URL, or trade link.
+            </Forms.FormText>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+            <a
+                href={GITHUB_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="View source on GitHub"
+                style={linkStyle}
+                onMouseEnter={e => {
+                    (e.currentTarget as HTMLElement).style.background = "linear-gradient(180deg, rgba(255,255,255,.10), rgba(255,255,255,.04))";
+                    (e.currentTarget as HTMLElement).style.borderColor = "rgba(255,255,255,.16)";
+                }}
+                onMouseLeave={e => {
+                    (e.currentTarget as HTMLElement).style.background = "linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02))";
+                    (e.currentTarget as HTMLElement).style.borderColor = "rgba(255,255,255,.08)";
+                }}
+                dangerouslySetInnerHTML={{ __html: `${GITHUB_SVG}<span>GitHub</span>` }}
+            />
+            <a
+                href={AUTHOR_STEAM_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Author's Steam profile"
+                style={{
+                    ...linkStyle,
+                    color: "#f5faff",
+                    background: "linear-gradient(135deg, #1b2838 0%, #2a475e 55%, #3b8ac4 130%)",
+                    border: "1px solid rgba(102,192,244,.35)",
+                }}
+                onMouseEnter={e => {
+                    (e.currentTarget as HTMLElement).style.background = "linear-gradient(135deg, #2a475e 0%, #3a6a8f 55%, #66c0f4 130%)";
+                }}
+                onMouseLeave={e => {
+                    (e.currentTarget as HTMLElement).style.background = "linear-gradient(135deg, #1b2838 0%, #2a475e 55%, #3b8ac4 130%)";
+                }}
+                dangerouslySetInnerHTML={{ __html: `${STEAM_SVG}<span>Steam</span>` }}
+            />
+        </div>
+    </div>
+);
+
 // ─── Plugin definition ────────────────────────────────────────────────────────
 
 export default definePlugin({
@@ -1255,6 +1358,7 @@ export default definePlugin({
     description: "Look up a Discord user's CS2 inventory value via their linked Steam (CSFloat prices), and show a Trade Offer button on your own profile.",
     authors: [{ name: "VisaHolder", id: 0n }],
     settings,
+    settingsAboutComponent: AboutComponent,
 
     start() {
         ensureStyle();
@@ -1262,11 +1366,11 @@ export default definePlugin({
 
         // Publish shared profile to the vsi-share worker (if user has cloud share on).
         // Non-blocking — fire-and-forget with a short delay so it doesn't race Vencord's boot.
-        setTimeout(() => { publishSharedProfile().catch(e => console.warn("[VSI] initial publish", e)); }, 5000);
+        publishTimeout = setTimeout(() => { publishSharedProfile().catch(e => console.warn("[VSI] initial publish", e)); }, 5000);
         // Also re-publish every 15 minutes so setting changes propagate without a Discord restart.
-        setInterval(() => { publishSharedProfile().catch(() => {}); }, 15 * 60 * 1000);
+        publishInterval = setInterval(() => { publishSharedProfile().catch(() => {}); }, 15 * 60 * 1000);
 
-        // Intercept "csinv <ref>" or "/csinv <ref>" typed in any channel — resolves + prices before Discord sends.
+        // Intercept "/csinv <ref>" typed in any channel — resolves + prices before Discord sends.
         preSendListener = async (channelId: string, message: any) => {
             const raw = (message?.content ?? "").trim();
             const m = raw.match(/^\/csinv\s+(.+)$/i);
@@ -1276,7 +1380,6 @@ export default definePlugin({
             return { cancel: true };
         };
         addMessagePreSendListener(preSendListener);
-
     },
 
     stop() {
@@ -1284,6 +1387,8 @@ export default definePlugin({
         observer = null;
         styleEl?.remove();
         styleEl = null;
+        if (publishTimeout) { clearTimeout(publishTimeout); publishTimeout = null; }
+        if (publishInterval) { clearInterval(publishInterval); publishInterval = null; }
         if (preSendListener) { removeMessagePreSendListener(preSendListener); preSendListener = null; }
         document.querySelectorAll('[data-vsi="1"]').forEach(n => n.remove());
     },
