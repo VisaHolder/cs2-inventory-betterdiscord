@@ -159,118 +159,196 @@ async function resolveSteamRef(input: string): Promise<SteamProfile | null> {
     }
 }
 
+// Section headers rendered inline in the settings list. Vencord treats OptionType.COMPONENT
+// entries as pure UI so they don't persist any value.
+const sectionStyle: React.CSSProperties = {
+    marginTop: 22,
+    marginBottom: 6,
+    paddingBottom: 8,
+    borderBottom: "1px solid var(--background-modifier-accent, rgba(255,255,255,.08))",
+};
+const sectionTitleStyle: React.CSSProperties = {
+    fontSize: 11,
+    fontWeight: 800,
+    letterSpacing: 0.8,
+    color: "var(--text-muted, #949ba4)",
+    textTransform: "uppercase",
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+};
+const sectionSubStyle: React.CSSProperties = {
+    fontSize: 12,
+    color: "var(--text-muted, #949ba4)",
+    marginTop: 3,
+    lineHeight: 1.4,
+};
+
+function Section({ icon, title, subtitle }: { icon: string; title: string; subtitle: string }) {
+    return (
+        <div style={sectionStyle}>
+            <div style={sectionTitleStyle}><span style={{ fontSize: 14 }}>{icon}</span>{title}</div>
+            <div style={sectionSubStyle}>{subtitle}</div>
+        </div>
+    );
+}
+
 const settings = definePluginSettings({
+    // ── Your profile ────────────────────────────────────────────────────────
+    header_profile: {
+        type: OptionType.COMPONENT,
+        component: () => <Section icon="👤" title="Your Profile" subtitle="How the Trade / Steam / Inventory buttons appear on your own Discord popout." />,
+    },
     tradeUrl: {
         type: OptionType.STRING,
-        description: "Your Steam trade offer URL — shows up as a button on your own Discord profile",
+        description: "Your Steam trade offer URL. Grab it from steamcommunity.com/my/tradeoffers/privacy — this is what the Trade button opens.",
         default: "",
         placeholder: "https://steamcommunity.com/tradeoffer/new/?partner=...&token=...",
     },
-    shareViaCloud: {
-        type: OptionType.BOOLEAN,
-        description: "Publish your trade URL / Steam profile to the vsi-share cloud so other plugin users see them on your Discord popout. On by default — set your trade URL below to publish it.",
-        default: true,
-    },
-    shareWorkerUrl: {
-        type: OptionType.STRING,
-        description: "vsi-share worker URL (leave blank to use the default hosted instance)",
-        default: "",
-        placeholder: "https://vsi-share.reap-dev.workers.dev",
-    },
-    shareTradeUrl: {
-        type: OptionType.BOOLEAN,
-        description: "When cloud share is on: include my trade URL in the published data",
-        default: true,
-    },
-    shareSteamProfile: {
-        type: OptionType.BOOLEAN,
-        description: "When cloud share is on: include a link to my Steam profile in the published data",
-        default: true,
-    },
     buttonTheme: {
         type: OptionType.SELECT,
-        description: "Trade button style",
+        description: "Color scheme for the Trade and Steam buttons.",
         options: [
-            { label: "Discord Blurple", value: "blurple", default: true },
-            { label: "Discord Green", value: "green" },
-            { label: "Steam Blue (gradient)", value: "steam" },
-            { label: "Pure Dark", value: "dark" },
-            { label: "Match Discord Theme (uses accent color)", value: "auto" },
+            { label: "Blurple — Discord's brand purple", value: "blurple", default: true },
+            { label: "Green — success-style accent", value: "green" },
+            { label: "Steam Blue — dark navy → sky-blue gradient", value: "steam" },
+            { label: "Dark — matte black minimal", value: "dark" },
+            { label: "Auto — follows your Discord accent", value: "auto" },
         ],
     },
     showOnOwnProfile: {
         type: OptionType.BOOLEAN,
-        description: "Show the Trade button on your own profile popout",
+        description: "Show the Trade + Steam button row on your own profile popout.",
         default: true,
+    },
+    showInventoryOnProfile: {
+        type: OptionType.BOOLEAN,
+        description: "Show the CS2 Inventory card (value, delta, top 5 items) on profile popouts — yours and friends'.",
+        default: true,
+    },
+
+    // ── Sharing ─────────────────────────────────────────────────────────────
+    header_share: {
+        type: OptionType.COMPONENT,
+        component: () => <Section icon="☁️" title="Sharing" subtitle="Publish your trade URL to the vsi-share cloud so friends running the plugin see it on your popout." />,
+    },
+    shareViaCloud: {
+        type: OptionType.BOOLEAN,
+        description: "Publish your data to the vsi-share cloud. Requires a Trade URL set above.",
+        default: true,
+    },
+    shareTradeUrl: {
+        type: OptionType.BOOLEAN,
+        description: "Include your Trade URL in what you publish. Turn off if you want to publish Steam profile only.",
+        default: true,
+    },
+    shareSteamProfile: {
+        type: OptionType.BOOLEAN,
+        description: "Include a link to your Steam profile in what you publish.",
+        default: true,
+    },
+    shareWorkerUrl: {
+        type: OptionType.STRING,
+        description: "Advanced: point at a self-hosted vsi-share Worker instead of the default. Leave blank for the hosted instance.",
+        default: "",
+        placeholder: "https://vsi-share.reap-dev.workers.dev",
+    },
+
+    // ── Prices ──────────────────────────────────────────────────────────────
+    header_prices: {
+        type: OptionType.COMPONENT,
+        component: () => <Section icon="💰" title="Prices" subtitle="Which marketplace to price your items from. CSFloat is fastest and usually accurate to within a few percent." />,
     },
     priceSource: {
         type: OptionType.SELECT,
-        description: "Where to pull prices from",
+        description: "Which marketplace's prices to use for /inventory.",
         options: [
-            { label: "CSFloat (bulk, instant) — RECOMMENDED", value: "csfloat", default: true },
-            { label: "Skinport (bulk, instant, USD/GBP/EUR)", value: "skinport" },
-            { label: "Live Steam Market (slow, always fresh)", value: "live_steam" },
+            { label: "CSFloat — bulk (~300ms), refreshed hourly", value: "csfloat", default: true },
+            { label: "Skinport — bulk (USD/GBP/EUR only)", value: "skinport" },
+            { label: "Live Steam Market — always fresh, ~1min per inventory", value: "live_steam" },
+        ],
+    },
+    marketCurrency: {
+        type: OptionType.SELECT,
+        description: "Currency for prices. Skinport only supports USD, GBP, and EUR.",
+        options: [
+            { label: "USD ($)", value: 1, default: true },
+            { label: "GBP (£)", value: 2 },
+            { label: "EUR (€)", value: 3 },
+            { label: "CHF", value: 5 },
+            { label: "RUB (₽)", value: 6 },
+            { label: "PLN (zł)", value: 7 },
+            { label: "BRL (R$)", value: 8 },
+            { label: "SGD (S$)", value: 24 },
+        ],
+    },
+    skinportPriceKind: {
+        type: OptionType.SELECT,
+        description: "Only applies when Price Source = Skinport. Which price to use.",
+        options: [
+            { label: "Suggested — Skinport's mid-market estimate", value: "suggested_price", default: true },
+            { label: "Min — cheapest current listing", value: "min_price" },
+            { label: "Median — middle of all listings", value: "median_price" },
+            { label: "Mean — average of all listings", value: "mean_price" },
         ],
     },
     useLiveSteamFallback: {
         type: OptionType.BOOLEAN,
-        description: "For bulk sources: fill items missing from the feed by hitting live Steam Market. Complete numbers but SLOW — adds ~2s per missing item and Steam rate-limits at ~20/min. Off keeps /inventory instant.",
+        description: "When on: after the bulk lookup, hit live Steam Market for anything the bulk feed missed (stickered/nametagged skins). Complete numbers but adds ~2s per missing item.",
         default: false,
     },
-    skinportPriceKind: {
-        type: OptionType.SELECT,
-        description: "Skinport only — which Skinport price to use",
-        options: [
-            { label: "Suggested price — Skinport's mid-market estimate", value: "suggested_price", default: true },
-            { label: "Min price — cheapest currently listed", value: "min_price" },
-            { label: "Median price — middle of all listings", value: "median_price" },
-            { label: "Mean price — average of all listings", value: "mean_price" },
-        ],
-    },
-    marketCurrency: {
-        type: OptionType.NUMBER,
-        description: "Currency: 1=USD, 2=GBP, 3=EUR, 5=CHF, 6=RUB, 7=PLN, 8=BRL, 24=SGD (Skinport supports USD/GBP/EUR only)",
-        default: 1,
-    },
-    requestDelayMs: {
-        type: OptionType.NUMBER,
-        description: "For live Steam Market: delay between requests (ms). 1600 is safe. Bump to 2500 if you 429.",
-        default: 1600,
-    },
-    priceCacheMinutes: {
-        type: OptionType.NUMBER,
-        description: "Minutes to cache the bulk price feed in memory. 60 is fine — prices don't move fast.",
-        default: 60,
-    },
-    showInventoryOnProfile: {
-        type: OptionType.BOOLEAN,
-        description: "Show your last-cached CS2 inventory value under the Trade button on your profile popout",
-        default: true,
+
+    // ── Profile card behavior ───────────────────────────────────────────────
+    header_card: {
+        type: OptionType.COMPONENT,
+        component: () => <Section icon="📊" title="Inventory Card" subtitle="Behavior of the CS2 Inventory card on profile popouts — deltas, staleness, extras." />,
     },
     showPriceChange: {
         type: OptionType.BOOLEAN,
-        description: "Show 📈/📉 delta since your previous /inventory snapshot (needs 2+ runs to appear)",
+        description: "Show a green/red delta chip when the total moved since your last /inventory run.",
         default: true,
     },
     showItemCount: {
         type: OptionType.BOOLEAN,
-        description: "Also show item count (e.g. \"35 items\") on the profile inventory badge",
+        description: 'Add "X items" to the card meta line.',
         default: false,
     },
     deltaMinAgeMinutes: {
         type: OptionType.NUMBER,
-        description: "Ignore snapshots newer than this many minutes when computing delta (avoids noisy 'since 2m ago')",
+        description: 'Ignore snapshots newer than this when computing the delta. Prevents noisy "since 2m ago" deltas from back-to-back runs.',
         default: 60,
     },
     snapshotStalenessHours: {
         type: OptionType.NUMBER,
-        description: "Show a 'stale' marker on the profile badge if the last /inventory is older than N hours (0 = never)",
+        description: 'Mark the card as STALE if the last /inventory is older than this many hours. Set to 0 to never mark stale.',
         default: 24,
+    },
+
+    // ── Chat & command behavior ─────────────────────────────────────────────
+    header_chat: {
+        type: OptionType.COMPONENT,
+        component: () => <Section icon="💬" title="Chat & Commands" subtitle="How /inventory and /csinv send their results." />,
     },
     postPublicly: {
         type: OptionType.BOOLEAN,
-        description: "If on, /inventory posts a real message. Off = only you see it.",
+        description: "When on: /inventory sends a real message to the channel (markdown, visible to everyone). When off: rich embed only you see.",
         default: false,
+    },
+
+    // ── Advanced ────────────────────────────────────────────────────────────
+    header_advanced: {
+        type: OptionType.COMPONENT,
+        component: () => <Section icon="⚙️" title="Advanced" subtitle="Tuning knobs — you probably don't need to touch these." />,
+    },
+    priceCacheMinutes: {
+        type: OptionType.NUMBER,
+        description: "How long to keep the bulk price feed in memory before refetching. Skinport/CSFloat only refresh hourly on their end so 60 is fine.",
+        default: 60,
+    },
+    requestDelayMs: {
+        type: OptionType.NUMBER,
+        description: "Live Steam Market only: delay between per-item requests, in milliseconds. 1600 keeps you under Steam's ~20/min rate limit. Bump if you 429.",
+        default: 1600,
     },
 });
 
