@@ -1,7 +1,7 @@
 /*
  * SteamInventoryValue — BetterDiscord edition
  * Copyright (c) 2026 VisaHolder
- * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-License-Identifier: MIT
  *
  * CS2 inventory value on Discord profile popouts, with Doppler/Gamma phase
  * pricing (CSFloat), FX-converted prices, and a Trade Offer / Steam button row.
