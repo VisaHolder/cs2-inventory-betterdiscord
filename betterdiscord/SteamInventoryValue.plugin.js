@@ -12,10 +12,26 @@
 var BD = window.BdApi;
 var PLUGIN_NAME = "SteamInventoryValue";
 var { Webpack } = BD;
-var UserStore = Webpack.getStore("UserStore");
-var UserProfileStore = Webpack.getStore("UserProfileStore");
-var SelectedGuildStore = Webpack.getStore("SelectedGuildStore");
-var RestAPI = Webpack.getModule((m) => m?.getAPIBaseURL && typeof m?.get === "function" && typeof m?.post === "function") ?? (Webpack.getByKeys ? Webpack.getByKeys("getAPIBaseURL", "get", "post") : void 0);
+var UserStore;
+var UserProfileStore;
+var SelectedGuildStore;
+var RestAPI;
+try {
+  UserStore = Webpack.getStore("UserStore");
+} catch {
+}
+try {
+  UserProfileStore = Webpack.getStore("UserProfileStore");
+} catch {
+}
+try {
+  SelectedGuildStore = Webpack.getStore("SelectedGuildStore");
+} catch {
+}
+try {
+  RestAPI = Webpack.getByKeys && Webpack.getByKeys("getAPIBaseURL", "get", "post") || Webpack.getModule((m) => m?.getAPIBaseURL && typeof m?.get === "function" && typeof m?.post === "function");
+} catch {
+}
 async function fetchJson(url, opts) {
   const bodyStr = opts?.body != null ? JSON.stringify(opts.body) : void 0;
   const headers = { ...opts?.headers ?? {} };
@@ -445,22 +461,6 @@ async function loadInventory(steamId, opts) {
   } else {
     misses.push(...uniqueNames);
   }
-  const shouldRunLive = opts.source === "live_steam" || opts.useLiveFallback && misses.length > 0;
-  if (shouldRunLive && misses.length > 0) {
-    const currency = settings.store.marketCurrency || 1;
-    const delay = Math.max(500, settings.store.requestDelayMs || 1600);
-    for (let i = 0; i < misses.length; i++) {
-      const name = misses[i];
-      try {
-        const p = await fetchSteamMarketPrice(name, currency);
-        if (p > 0) priceByName.set(name, p);
-      } catch (e) {
-        console.error("[VSI] live price fetch failed for", name, e);
-      }
-      opts.onProgress?.(i + 1, misses.length);
-      if (i < misses.length - 1) await sleep(delay);
-    }
-  }
   const priceByGroup = /* @__PURE__ */ new Map();
   const hasKey = !!(settings.store.csfloatApiKey || "").trim();
   for (const [gk, g] of groups) {
@@ -472,30 +472,55 @@ async function loadInventory(steamId, opts) {
     if (p == null) p = priceByName.get(g.name) ?? null;
     if (p != null) priceByGroup.set(gk, p);
   }
-  const unpriced = [];
-  for (const [gk, g] of groups) if (!priceByGroup.has(gk)) unpriced.push(g.phase ? `${g.name} (${g.phase})` : g.name);
-  let total = 0, priced = 0;
-  const perItem = [];
-  for (const [gk, g] of groups) {
-    const p = priceByGroup.get(gk);
-    if (p == null) continue;
-    total += p * g.qty;
-    priced += g.qty;
-    perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty });
-  }
-  perItem.sort((a, b) => b.price * b.qty - a.price * a.qty);
-  const topItems = perItem.slice(0, 5).map((i) => ({ name: i.qty > 1 ? `${i.name} \xD7${i.qty}` : i.name, price: i.price * i.qty }));
-  return {
-    total,
-    priced,
-    count: inv.assets.length,
-    marketableCount,
-    uniqueNames: uniqueNames.length,
-    isPrivate: false,
-    topItems,
-    unpriced: unpriced.slice(0, 5),
-    skippedNonMarketable
+  const buildResult = () => {
+    const unpriced = [];
+    for (const [gk, g] of groups) if (!priceByGroup.has(gk)) unpriced.push(g.phase ? `${g.name} (${g.phase})` : g.name);
+    let total = 0, priced = 0;
+    const perItem = [];
+    for (const [gk, g] of groups) {
+      const p = priceByGroup.get(gk);
+      if (p == null) continue;
+      total += p * g.qty;
+      priced += g.qty;
+      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty });
+    }
+    perItem.sort((a, b) => b.price * b.qty - a.price * a.qty);
+    const topItems = perItem.slice(0, 5).map((i) => ({ name: i.qty > 1 ? `${i.name} \xD7${i.qty}` : i.name, price: i.price * i.qty }));
+    return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
   };
+  const shouldRunLive = opts.source === "live_steam" || opts.useLiveFallback && misses.length > 0;
+  const runFallback = async () => {
+    const currency = settings.store.marketCurrency || 1;
+    const delay = Math.max(500, settings.store.requestDelayMs || 1600);
+    for (let i = 0; i < misses.length; i++) {
+      const name = misses[i];
+      try {
+        const p = await fetchSteamMarketPrice(name, currency);
+        if (p > 0) {
+          priceByName.set(name, p);
+          for (const [gk, g] of groups) if (!priceByGroup.has(gk) && !g.phase && g.name === name) priceByGroup.set(gk, p);
+        }
+      } catch (e) {
+        console.error("[VSI] live price fetch failed for", name, e);
+      }
+      opts.onProgress?.(i + 1, misses.length);
+      if (i < misses.length - 1) await sleep(delay);
+    }
+  };
+  if (shouldRunLive && misses.length > 0) {
+    if (opts.onUpdate && opts.source !== "live_steam") {
+      runFallback().then(() => {
+        try {
+          opts.onUpdate(buildResult());
+        } catch {
+        }
+      }).catch(() => {
+      });
+    } else {
+      await runFallback();
+    }
+  }
+  return buildResult();
 }
 function currencySymbol(c) {
   return {
@@ -614,17 +639,21 @@ var BUTTON_CSS = `
 .vsi-inv-card {
     display: flex;
     flex-direction: column;
+    width: 100%;
+    box-sizing: border-box;
     padding: 10px 12px 10px 12px;
     border-radius: 8px;
     font-family: var(--font-primary, "gg sans"), sans-serif;
-    background: linear-gradient(180deg, rgba(255,255,255,.045) 0%, rgba(255,255,255,.02) 100%);
-    border: 1px solid rgba(255,255,255,.06);
-    color: var(--text-normal, #dbdee1);
+    /* Self-contained dark widget: opaque so it stays readable on ANY profile
+       theme (light or dark Nitro gradients) \u2014 never blends into the popout. */
+    background: rgba(25, 26, 28, 0.94);
+    border: 1px solid rgba(255,255,255,.08);
+    color: #dbdee1;
     line-height: 1.25;
     user-select: none;
     cursor: default;
     overflow: hidden;
-    box-shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 1px 2px rgba(0,0,0,.15);
+    box-shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 2px 8px rgba(0,0,0,.35);
 }
 .vsi-inv-card .vsi-card-header {
     display: flex;
@@ -633,7 +662,7 @@ var BUTTON_CSS = `
     font-size: 10.5px;
     font-weight: 700;
     letter-spacing: 0.07em;
-    color: var(--text-muted, #949ba4);
+    color: #b5bac1;
     text-transform: uppercase;
     margin-bottom: 6px;
 }
@@ -647,12 +676,12 @@ var BUTTON_CSS = `
     transition: opacity .12s ease, background .12s ease, color .12s ease;
     line-height: 1;
     transform-origin: 50% 50%;
-    color: var(--text-muted, #949ba4);
+    color: #b5bac1;
     text-transform: none;
     letter-spacing: 0;
     user-select: none;
 }
-.vsi-inv-card .vsi-card-header .vsi-refresh:hover { opacity: 1; background: rgba(255,255,255,.08); color: var(--text-normal, #f2f3f5); }
+.vsi-inv-card .vsi-card-header .vsi-refresh:hover { opacity: 1; background: rgba(255,255,255,.08); color: #f2f3f5; }
 .vsi-inv-card .vsi-card-header .vsi-refresh:active { background: rgba(88,101,242,.25); }
 .vsi-inv-card.loading .vsi-refresh {
     animation: vsi-spin 0.9s linear infinite;
@@ -671,7 +700,7 @@ var BUTTON_CSS = `
 .vsi-inv-card .vsi-value {
     font-size: 18px;
     font-weight: 800;
-    color: var(--text-normal, #f2f3f5);
+    color: #f2f3f5;
     letter-spacing: -0.01em;
     font-variant-numeric: tabular-nums;
     line-height: 1;
@@ -687,7 +716,7 @@ var BUTTON_CSS = `
 .vsi-inv-card .vsi-delta.down { color: #f87171; background: rgba(242,63,67,.15); }
 .vsi-inv-card .vsi-meta {
     font-size: 11px;
-    color: var(--text-muted, #949ba4);
+    color: #b5bac1;
     font-weight: 500;
     margin-bottom: 8px;
 }
@@ -719,21 +748,21 @@ var BUTTON_CSS = `
     font-weight: 500;
 }
 .vsi-inv-card .vsi-top-row .vsi-top-name {
-    color: var(--text-normal, #dbdee1);
+    color: #dbdee1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     flex: 1;
 }
 .vsi-inv-card .vsi-top-row .vsi-top-price {
-    color: var(--text-normal, #f2f3f5);
+    color: #f2f3f5;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
 }
 .vsi-inv-card .vsi-empty {
     font-size: 11.5px;
-    color: var(--text-muted, #949ba4);
+    color: #b5bac1;
     padding: 4px 0 2px 0;
     text-align: center;
     font-style: italic;
@@ -926,7 +955,7 @@ function buildButton(shownUserId, isOwn, wantTradeRow, wantCard) {
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
-async function runInventoryForUser(shownUserId) {
+async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
   const steamId = await getSteamId(shownUserId);
   if (!steamId) throw new Error("no-steam");
   const validSources = /* @__PURE__ */ new Set(["csfloat", "skinport", "live_steam"]);
@@ -934,20 +963,24 @@ async function runInventoryForUser(shownUserId) {
   const source = validSources.has(stored) ? stored : "csfloat";
   const useLiveFallback = !!settings.store.useLiveSteamFallback;
   const cur = settings.store.marketCurrency || 1;
-  const inv = await loadInventory(steamId, { source, useLiveFallback });
-  if (inv.isPrivate) throw new Error("inventory-private");
-  const snap = {
-    total: inv.total,
-    priced: inv.priced,
-    itemCount: inv.count,
-    marketableCount: inv.marketableCount,
-    uniqueNames: inv.uniqueNames,
+  const snapFrom = (r) => ({
+    total: r.total,
+    priced: r.priced,
+    itemCount: r.count,
+    marketableCount: r.marketableCount,
+    uniqueNames: r.uniqueNames,
     ts: Date.now(),
     source,
     currency: cur,
-    topItems: inv.topItems
-  };
-  await pushSnapshot(steamId, snap);
+    topItems: r.topItems
+  });
+  const onUpdate = onBackgroundUpdate ? (final) => {
+    pushSnapshot(steamId, snapFrom(final)).then(() => onBackgroundUpdate()).catch(() => {
+    });
+  } : void 0;
+  const inv = await loadInventory(steamId, { source, useLiveFallback, onUpdate });
+  if (inv.isPrivate) throw new Error("inventory-private");
+  await pushSnapshot(steamId, snapFrom(inv));
 }
 async function refreshCard(card, shownUserId, isOwn) {
   if (card.classList.contains("loading")) return;
@@ -956,7 +989,10 @@ async function refreshCard(card, shownUserId, isOwn) {
   const originalTitle = refresh?.title;
   if (refresh) refresh.title = "Refreshing\u2026";
   try {
-    await runInventoryForUser(shownUserId);
+    await runInventoryForUser(shownUserId, () => {
+      if (card.isConnected) populateInventoryCard(card, shownUserId, isOwn).catch(() => {
+      });
+    });
   } catch (e) {
     console.error("[VSI] refresh failed", e);
     if (e?.message === "no-steam") {

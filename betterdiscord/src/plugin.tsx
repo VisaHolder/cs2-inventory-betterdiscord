@@ -12,11 +12,17 @@ const PLUGIN_NAME = "SteamInventoryValue";
 const { Webpack } = BD;
 
 // ── Discord internals via BetterDiscord's webpack ───────────────────────────
-const UserStore: any = Webpack.getStore("UserStore");
-const UserProfileStore: any = Webpack.getStore("UserProfileStore");
-const SelectedGuildStore: any = Webpack.getStore("SelectedGuildStore");
-const RestAPI: any = Webpack.getModule((m: any) => m?.getAPIBaseURL && typeof m?.get === "function" && typeof m?.post === "function")
-    ?? (Webpack.getByKeys ? Webpack.getByKeys("getAPIBaseURL", "get", "post") : undefined);
+// Resolved defensively: a webpack lookup throwing (some Discord modules have
+// getters that throw when a filter touches them) must never stop the plugin
+// from loading. Anything that fails stays null and its feature degrades.
+let UserStore: any, UserProfileStore: any, SelectedGuildStore: any, RestAPI: any;
+try { UserStore = Webpack.getStore("UserStore"); } catch { /* */ }
+try { UserProfileStore = Webpack.getStore("UserProfileStore"); } catch { /* */ }
+try { SelectedGuildStore = Webpack.getStore("SelectedGuildStore"); } catch { /* */ }
+try {
+    RestAPI = (Webpack.getByKeys && Webpack.getByKeys("getAPIBaseURL", "get", "post"))
+        || Webpack.getModule((m: any) => m?.getAPIBaseURL && typeof m?.get === "function" && typeof m?.post === "function");
+} catch { /* */ }
 
 // ── External HTTP. BdApi.Net.fetch is CSP-free (like Vencord's native helper),
 //    so requests to steamcommunity.com / csfloat.com / etc. are not blocked. ──
@@ -413,6 +419,9 @@ interface PricingOptions {
     source: string;
     useLiveFallback: boolean;
     onProgress?: (done: number, total: number) => void;
+    // When set, the slow live-Steam fallback runs in the background and calls this with the
+    // updated result once it finishes, so loadInventory can return the CSFloat total instantly.
+    onUpdate?: (result: InventoryResult) => void;
 }
 
 // ── Doppler / Gamma Doppler phase pricing ──────────────────────────────────────
@@ -552,7 +561,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
     }
     const uniqueNames = [...new Set([...groups.values()].map(g => g.name))];
 
-    // ── Generic (name-keyed) pricing: bulk feed first, live Steam Market for the misses. ──
+    // ── Generic (name-keyed) pricing: bulk feed. Live Steam fills the misses later. ──
     const priceByName = new Map<string, number>();
     const misses: string[] = [];
     if (opts.source !== "live_steam") {
@@ -565,25 +574,8 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
     } else {
         misses.push(...uniqueNames);
     }
-    const shouldRunLive = opts.source === "live_steam" || (opts.useLiveFallback && misses.length > 0);
-    if (shouldRunLive && misses.length > 0) {
-        const currency = settings.store.marketCurrency || 1;
-        const delay = Math.max(500, settings.store.requestDelayMs || 1600);
-        for (let i = 0; i < misses.length; i++) {
-            const name = misses[i];
-            try {
-                const p = await fetchSteamMarketPrice(name, currency);
-                if (p > 0) priceByName.set(name, p);
-            } catch (e) {
-                console.error("[VSI] live price fetch failed for", name, e);
-            }
-            opts.onProgress?.(i + 1, misses.length);
-            if (i < misses.length - 1) await sleep(delay);
-        }
-    }
 
-    // ── Per-group pricing. Doppler phases get a phase-specific CSFloat price (if a key is set),
-    //    falling back to the generic name price; everything else uses the generic name price. ──
+    // ── Per-group pricing (bulk + Doppler phase). Fast: no per-item Steam calls here. ──
     const priceByGroup = new Map<string, number>();
     const hasKey = !!(settings.store.csfloatApiKey || "").trim();
     for (const [gk, g] of groups) {
@@ -596,33 +588,56 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         if (p != null) priceByGroup.set(gk, p);
     }
 
-    // Everything not priced is unpriced.
-    const unpriced: string[] = [];
-    for (const [gk, g] of groups) if (!priceByGroup.has(gk)) unpriced.push(g.phase ? `${g.name} (${g.phase})` : g.name);
-
-    let total = 0, priced = 0;
-    const perItem: { name: string; price: number; qty: number }[] = [];
-    for (const [gk, g] of groups) {
-        const p = priceByGroup.get(gk);
-        if (p == null) continue;
-        total += p * g.qty;
-        priced += g.qty;
-        perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty });
-    }
-    perItem.sort((a, b) => (b.price * b.qty) - (a.price * a.qty));
-    const topItems = perItem.slice(0, 5).map(i => ({ name: i.qty > 1 ? `${i.name} ×${i.qty}` : i.name, price: i.price * i.qty }));
-
-    return {
-        total,
-        priced,
-        count: inv.assets.length,
-        marketableCount,
-        uniqueNames: uniqueNames.length,
-        isPrivate: false,
-        topItems,
-        unpriced: unpriced.slice(0, 5),
-        skippedNonMarketable,
+    // Assemble an InventoryResult from the current price maps (re-run after the fallback fills misses).
+    const buildResult = (): InventoryResult => {
+        const unpriced: string[] = [];
+        for (const [gk, g] of groups) if (!priceByGroup.has(gk)) unpriced.push(g.phase ? `${g.name} (${g.phase})` : g.name);
+        let total = 0, priced = 0;
+        const perItem: { name: string; price: number; qty: number }[] = [];
+        for (const [gk, g] of groups) {
+            const p = priceByGroup.get(gk);
+            if (p == null) continue;
+            total += p * g.qty;
+            priced += g.qty;
+            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty });
+        }
+        perItem.sort((a, b) => (b.price * b.qty) - (a.price * a.qty));
+        const topItems = perItem.slice(0, 5).map(i => ({ name: i.qty > 1 ? `${i.name} ×${i.qty}` : i.name, price: i.price * i.qty }));
+        return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
     };
+
+    // ── Live Steam Market fallback for CSFloat's misses (charms/passes/graffiti it doesn't list).
+    //    Steam rate-limits to ~1 request/1.6s, so this is the slow part. When an onUpdate callback
+    //    is supplied we run it in the BACKGROUND and push an updated result when it finishes —
+    //    returning the CSFloat-priced total instantly. Without a callback (or for the live_steam
+    //    source, where there is no fast result) we run it inline. ──
+    const shouldRunLive = opts.source === "live_steam" || (opts.useLiveFallback && misses.length > 0);
+    const runFallback = async () => {
+        const currency = settings.store.marketCurrency || 1;
+        const delay = Math.max(500, settings.store.requestDelayMs || 1600);
+        for (let i = 0; i < misses.length; i++) {
+            const name = misses[i];
+            try {
+                const p = await fetchSteamMarketPrice(name, currency);
+                if (p > 0) {
+                    priceByName.set(name, p);
+                    for (const [gk, g] of groups) if (!priceByGroup.has(gk) && !g.phase && g.name === name) priceByGroup.set(gk, p);
+                }
+            } catch (e) { console.error("[VSI] live price fetch failed for", name, e); }
+            opts.onProgress?.(i + 1, misses.length);
+            if (i < misses.length - 1) await sleep(delay);
+        }
+    };
+
+    if (shouldRunLive && misses.length > 0) {
+        if (opts.onUpdate && opts.source !== "live_steam") {
+            runFallback().then(() => { try { opts.onUpdate!(buildResult()); } catch { /* */ } }).catch(() => { /* */ });
+        } else {
+            await runFallback();
+        }
+    }
+
+    return buildResult();
 }
 
 function currencySymbol(c: number): string {
@@ -778,17 +793,21 @@ const BUTTON_CSS = `
 .vsi-inv-card {
     display: flex;
     flex-direction: column;
+    width: 100%;
+    box-sizing: border-box;
     padding: 10px 12px 10px 12px;
     border-radius: 8px;
     font-family: var(--font-primary, "gg sans"), sans-serif;
-    background: linear-gradient(180deg, rgba(255,255,255,.045) 0%, rgba(255,255,255,.02) 100%);
-    border: 1px solid rgba(255,255,255,.06);
-    color: var(--text-normal, #dbdee1);
+    /* Self-contained dark widget: opaque so it stays readable on ANY profile
+       theme (light or dark Nitro gradients) — never blends into the popout. */
+    background: rgba(25, 26, 28, 0.94);
+    border: 1px solid rgba(255,255,255,.08);
+    color: #dbdee1;
     line-height: 1.25;
     user-select: none;
     cursor: default;
     overflow: hidden;
-    box-shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 1px 2px rgba(0,0,0,.15);
+    box-shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 2px 8px rgba(0,0,0,.35);
 }
 .vsi-inv-card .vsi-card-header {
     display: flex;
@@ -797,7 +816,7 @@ const BUTTON_CSS = `
     font-size: 10.5px;
     font-weight: 700;
     letter-spacing: 0.07em;
-    color: var(--text-muted, #949ba4);
+    color: #b5bac1;
     text-transform: uppercase;
     margin-bottom: 6px;
 }
@@ -811,12 +830,12 @@ const BUTTON_CSS = `
     transition: opacity .12s ease, background .12s ease, color .12s ease;
     line-height: 1;
     transform-origin: 50% 50%;
-    color: var(--text-muted, #949ba4);
+    color: #b5bac1;
     text-transform: none;
     letter-spacing: 0;
     user-select: none;
 }
-.vsi-inv-card .vsi-card-header .vsi-refresh:hover { opacity: 1; background: rgba(255,255,255,.08); color: var(--text-normal, #f2f3f5); }
+.vsi-inv-card .vsi-card-header .vsi-refresh:hover { opacity: 1; background: rgba(255,255,255,.08); color: #f2f3f5; }
 .vsi-inv-card .vsi-card-header .vsi-refresh:active { background: rgba(88,101,242,.25); }
 .vsi-inv-card.loading .vsi-refresh {
     animation: vsi-spin 0.9s linear infinite;
@@ -835,7 +854,7 @@ const BUTTON_CSS = `
 .vsi-inv-card .vsi-value {
     font-size: 18px;
     font-weight: 800;
-    color: var(--text-normal, #f2f3f5);
+    color: #f2f3f5;
     letter-spacing: -0.01em;
     font-variant-numeric: tabular-nums;
     line-height: 1;
@@ -851,7 +870,7 @@ const BUTTON_CSS = `
 .vsi-inv-card .vsi-delta.down { color: #f87171; background: rgba(242,63,67,.15); }
 .vsi-inv-card .vsi-meta {
     font-size: 11px;
-    color: var(--text-muted, #949ba4);
+    color: #b5bac1;
     font-weight: 500;
     margin-bottom: 8px;
 }
@@ -883,21 +902,21 @@ const BUTTON_CSS = `
     font-weight: 500;
 }
 .vsi-inv-card .vsi-top-row .vsi-top-name {
-    color: var(--text-normal, #dbdee1);
+    color: #dbdee1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     flex: 1;
 }
 .vsi-inv-card .vsi-top-row .vsi-top-price {
-    color: var(--text-normal, #f2f3f5);
+    color: #f2f3f5;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
 }
 .vsi-inv-card .vsi-empty {
     font-size: 11.5px;
-    color: var(--text-muted, #949ba4);
+    color: #b5bac1;
     padding: 4px 0 2px 0;
     text-align: center;
     font-style: italic;
@@ -1102,7 +1121,7 @@ function escapeHtml(s: string): string {
 }
 
 // Runs the same pricing pipeline as /inventory but for a given Discord user id, then persists a snapshot.
-async function runInventoryForUser(shownUserId: string): Promise<void> {
+async function runInventoryForUser(shownUserId: string, onBackgroundUpdate?: () => void): Promise<void> {
     const steamId = await getSteamId(shownUserId);
     if (!steamId) throw new Error("no-steam");
 
@@ -1112,21 +1131,26 @@ async function runInventoryForUser(shownUserId: string): Promise<void> {
     const useLiveFallback = !!settings.store.useLiveSteamFallback;
     const cur = settings.store.marketCurrency || 1;
 
-    const inv = await loadInventory(steamId, { source, useLiveFallback });
-    if (inv.isPrivate) throw new Error("inventory-private");
-
-    const snap: Snapshot = {
-        total: inv.total,
-        priced: inv.priced,
-        itemCount: inv.count,
-        marketableCount: inv.marketableCount,
-        uniqueNames: inv.uniqueNames,
+    const snapFrom = (r: InventoryResult): Snapshot => ({
+        total: r.total,
+        priced: r.priced,
+        itemCount: r.count,
+        marketableCount: r.marketableCount,
+        uniqueNames: r.uniqueNames,
         ts: Date.now(),
         source,
         currency: cur,
-        topItems: inv.topItems,
-    };
-    await pushSnapshot(steamId, snap);
+        topItems: r.topItems,
+    });
+
+    // When the background Steam fallback finishes, persist the fuller total and re-render the card.
+    const onUpdate = onBackgroundUpdate
+        ? (final: InventoryResult) => { pushSnapshot(steamId, snapFrom(final)).then(() => onBackgroundUpdate()).catch(() => { /* */ }); }
+        : undefined;
+
+    const inv = await loadInventory(steamId, { source, useLiveFallback, onUpdate });
+    if (inv.isPrivate) throw new Error("inventory-private");
+    await pushSnapshot(steamId, snapFrom(inv));
 }
 
 async function refreshCard(card: HTMLElement, shownUserId: string, isOwn: boolean) {
@@ -1136,7 +1160,11 @@ async function refreshCard(card: HTMLElement, shownUserId: string, isOwn: boolea
     const originalTitle = refresh?.title;
     if (refresh) refresh.title = "Refreshing…";
     try {
-        await runInventoryForUser(shownUserId);
+        // The background Steam-fallback callback re-renders the card in place once the slow
+        // per-item prices land, so the card shows the CSFloat total instantly and fills in after.
+        await runInventoryForUser(shownUserId, () => {
+            if (card.isConnected) populateInventoryCard(card, shownUserId, isOwn).catch(() => { /* */ });
+        });
     } catch (e: any) {
         console.error("[VSI] refresh failed", e);
         if (e?.message === "no-steam") {
