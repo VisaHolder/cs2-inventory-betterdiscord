@@ -139,6 +139,11 @@ var SETTINGS_SCHEMA = {
     default: "",
     placeholder: "CSFloat API key"
   },
+  useSharedCache: {
+    type: OptionType.BOOLEAN,
+    description: "Use the shared inventory-value cache. When on, once anyone has priced a profile it loads instantly for everyone else (and phase-accurate prices propagate to users without a CSFloat key). Only the public SteamID + inventory value is shared \u2014 no Discord identity. Turn off to price everything locally.",
+    default: true
+  },
   // ── Profile card behavior ───────────────────────────────────────────────
   showPriceChange: {
     type: OptionType.BOOLEAN,
@@ -553,6 +558,53 @@ async function pushSnapshot(steamId, snap) {
   const list = await getSnapshots(steamId);
   list.unshift(snap);
   await DataStore.set(snapKey(steamId), list.slice(0, 20));
+}
+var CACHE_WORKER = "https://vsi-cache.reap-dev.workers.dev";
+var CACHE_FRESH_MS = 25 * 6e4;
+async function fxFor(cur) {
+  const code = currencyCode(cur);
+  return code === "USD" ? 1 : await getUsdRate(code);
+}
+async function cacheGetInventory(steamId, cur) {
+  if (!settings.store.useSharedCache) return null;
+  try {
+    const data = await fetchJson(`${CACHE_WORKER}/inv/${steamId}`);
+    if (!data?.found || typeof data.total_usd !== "number") return null;
+    if (Date.now() - (data.ts || 0) > CACHE_FRESH_MS) return null;
+    const fx = await fxFor(cur);
+    return {
+      total: data.total_usd * fx,
+      priced: data.priced ?? 0,
+      itemCount: data.item_count ?? 0,
+      marketableCount: data.marketable_count ?? 0,
+      uniqueNames: data.unique_names ?? 0,
+      ts: data.ts,
+      source: "csfloat",
+      currency: cur,
+      topItems: (data.top_items ?? []).map((t) => ({ name: t.name, price: (t.price_usd ?? 0) * fx }))
+    };
+  } catch {
+    return null;
+  }
+}
+async function cachePushInventory(steamId, snap) {
+  if (!settings.store.useSharedCache) return;
+  try {
+    const fx = await fxFor(snap.currency || 1);
+    if (!fx) return;
+    await fetchJson(`${CACHE_WORKER}/inv/${steamId}`, {
+      method: "POST",
+      body: {
+        total_usd: snap.total / fx,
+        priced: snap.priced,
+        item_count: snap.itemCount,
+        marketable_count: snap.marketableCount ?? 0,
+        unique_names: snap.uniqueNames,
+        top_items: (snap.topItems ?? []).map((t) => ({ name: t.name, price_usd: t.price / fx }))
+      }
+    });
+  } catch {
+  }
 }
 function humanAgo(ms) {
   const s = Math.round(ms / 1e3);
@@ -979,12 +1031,18 @@ async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
     topItems: r.topItems
   });
   const onUpdate = onBackgroundUpdate ? (final) => {
-    pushSnapshot(steamId, snapFrom(final)).then(() => onBackgroundUpdate()).catch(() => {
+    const s = snapFrom(final);
+    pushSnapshot(steamId, s).then(() => {
+      cachePushInventory(steamId, s);
+      onBackgroundUpdate();
+    }).catch(() => {
     });
   } : void 0;
   const inv = await loadInventory(steamId, { source, useLiveFallback, onUpdate });
   if (inv.isPrivate) throw new Error("inventory-private");
-  await pushSnapshot(steamId, snapFrom(inv));
+  const snap = snapFrom(inv);
+  await pushSnapshot(steamId, snap);
+  cachePushInventory(steamId, snap);
 }
 async function refreshCard(card, shownUserId, isOwn) {
   if (card.classList.contains("loading")) return;
@@ -1033,7 +1091,15 @@ async function populateInventoryCard(card, shownUserId, isOwn) {
     return;
   }
   const snaps = await getSnapshots(steamId);
-  const latest = snaps[0];
+  let latest = snaps[0];
+  if (!latest) {
+    const cached = await cacheGetInventory(steamId, settings.store.marketCurrency || 1);
+    if (cached) {
+      latest = cached;
+      pushSnapshot(steamId, cached).catch(() => {
+      });
+    }
+  }
   if (!latest) {
     const who = isOwn ? "your" : "their";
     card.innerHTML = `

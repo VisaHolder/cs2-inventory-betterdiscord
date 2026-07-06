@@ -1,10 +1,8 @@
-name = "vsi-share"
+name = "vsi-cache"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
-
-# Fill these before `wrangler deploy`:
-# account_id = "YOUR_ACCOUNT_ID"
+account_id = "5dc46952f0971f7bb27e0e206f37620f"
 
 [[kv_namespaces]]
-binding = "PROFILES"
-id = "YOUR_KV_NAMESPACE_ID"
+binding = "INV"
+id = "420b8fed9c1544fcb7e22186859d54a9"
