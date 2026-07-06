@@ -501,7 +501,11 @@ async function loadInventory(steamId, opts) {
           for (const [gk, g] of groups) if (!priceByGroup.has(gk) && !g.phase && g.name === name) priceByGroup.set(gk, p);
         }
       } catch (e) {
-        console.error("[VSI] live price fetch failed for", name, e);
+        if (String(e?.message || e).includes("429")) {
+          console.warn("[VSI] Steam rate-limited \u2014 skipping the remaining live-price fallback");
+          break;
+        }
+        console.warn("[VSI] live price fetch failed for", name, e);
       }
       opts.onProgress?.(i + 1, misses.length);
       if (i < misses.length - 1) await sleep(delay);
