@@ -8,13 +8,13 @@ import { ApplicationCommandInputType, ApplicationCommandOptionType, sendBotMessa
 import { addMessagePreSendListener, removeMessagePreSendListener } from "@api/MessageEvents";
 import { popNotice, showNotice } from "@api/Notices";
 import { definePluginSettings } from "@api/Settings";
-import definePlugin, { OptionType } from "@utils/types";
+import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { DataStore } from "@api/index";
 import { Forms, MessageActions, React, RestAPI, UserProfileStore, UserStore } from "@webpack/common";
 
 // Discord's CSP blocks fetch() to non-whitelisted hosts (steamcommunity.com, csfloat.com, etc.).
 // Route all external calls through Vencord's native (Electron main-process) helper, which is CSP-free.
-const Native = (window as any).VencordNative?.pluginHelpers?.SteamInventoryValue as typeof import("./native") | undefined;
+const Native = (window as any).VencordNative?.pluginHelpers?.SteamInventoryValue as PluginNative<typeof import("./native")> | undefined;
 
 async function fetchJson(url: string, opts?: { method?: string; body?: any; headers?: Record<string, string> }): Promise<any> {
     const bodyStr = opts?.body != null ? JSON.stringify(opts.body) : undefined;
@@ -139,9 +139,9 @@ async function resolveSteamRef(input: string): Promise<SteamProfile | null> {
     // Vanity URL: /id/<name>, OR bare vanity name
     if (!steamId) {
         let vanity: string | null = null;
-        const m = raw.match(/steamcommunity\.com\/id\/([^\/?\s]+)/i);
+        const m = raw.match(/steamcommunity\.com\/id\/([^/?\s]+)/i);
         if (m) vanity = m[1];
-        else if (!/[\s\/]/.test(raw) && !/^\d+$/.test(raw)) vanity = raw;
+        else if (!/[\s/]/.test(raw) && !/^\d+$/.test(raw)) vanity = raw;
 
         if (vanity) {
             try {
@@ -454,7 +454,7 @@ function parseSteamPrice(raw: string): number {
 
 async function fetchSteamMarketPrice(marketHashName: string, currency: number): Promise<number> {
     const key = `${marketHashName}|${currency}`;
-    const ttl = (settings.store.priceMemoryCacheMinutes || 15) * 60_000;
+    const ttl = (settings.store.priceCacheMinutes || 15) * 60_000;
     const hit = priceMemo.get(key);
     if (hit && Date.now() - hit.ts < ttl) return hit.price;
 
