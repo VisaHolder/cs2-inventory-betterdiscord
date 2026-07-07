@@ -1400,9 +1400,10 @@ function buildSettingsPanel() {
 }
 function invMarkdown(displayName, r, cur, steamId, tradeUrl) {
   const top = r.topItems ?? [];
+  const sym = currencySymbol(cur);
   const nums = top.map((i) => i.price.toFixed(2));
   const w = nums.reduce((a, s) => Math.max(a, s.length), 0);
-  const body = top.map((i, k) => `${nums[k].padStart(w)}  ${abbrevItem(i.name)}`).join("\n");
+  const body = top.map((i, k) => `${sym}${nums[k].padStart(w)}  ${abbrevItem(i.name)}`).join("\n");
   const untr = (r.skippedNonMarketable ?? 0) > 0 ? ` \xB7 ${r.skippedNonMarketable} untradeable` : "";
   const links = [
     steamId ? `<https://steamcommunity.com/profiles/${steamId}>` : "",

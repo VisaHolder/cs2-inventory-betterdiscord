@@ -1603,11 +1603,12 @@ type PricedLike = { total: number; priced: number; marketableCount?: number; uni
 
 function invMarkdown(displayName: string, r: PricedLike, cur: number, steamId?: string, tradeUrl?: string): string {
     const top = r.topItems ?? [];
-    // Bare numbers (currency lives in the header total), right-aligned so the decimal
-    // points line up. A per-row "C$" made the left edge ragged — this is the fix.
+    // Currency symbol pinned to the left edge, number right-padded so the decimal points
+    // line up (padding the whole "C$40.59" instead made the C$ column ragged).
+    const sym = currencySymbol(cur);
     const nums = top.map(i => i.price.toFixed(2));
     const w = nums.reduce((a, s) => Math.max(a, s.length), 0);
-    const body = top.map((i, k) => `${nums[k].padStart(w)}  ${abbrevItem(i.name)}`).join("\n");
+    const body = top.map((i, k) => `${sym}${nums[k].padStart(w)}  ${abbrevItem(i.name)}`).join("\n");
     const untr = (r.skippedNonMarketable ?? 0) > 0 ? ` · ${r.skippedNonMarketable} untradeable` : "";
     // Discord doesn't render masked links in normal user messages, so links are bare
     // URLs wrapped in <> (clickable, no big embed card). Shown as a small footer line.
