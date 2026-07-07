@@ -634,8 +634,11 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         }
         if (base == null) base = priceByName.get(g.name) ?? null;
         if (base == null) continue; // unpriced base → leave for the live fallback
+        // Souvenir skins carry non-removable, baked-in tournament stickers already reflected in the
+        // souvenir's own price — valuing those as standalone stickers wildly overstates them.
+        const isSouvenir = /^Souvenir /.test(g.name);
         let stickerVal = 0;
-        for (const sn of g.stickers) { const sp = bulk.get(sn); if (sp && sp > 0) stickerVal += sp; }
+        if (!isSouvenir) for (const sn of g.stickers) { const sp = bulk.get(sn); if (sp && sp > 0) stickerVal += sp; }
         priceByGroup.set(gk, base + stickerVal);
         if (stickerVal > 0) stickerByGroup.set(gk, { value: stickerVal, count: g.stickers.length });
     }

@@ -556,8 +556,9 @@ async function loadInventory(steamId, opts) {
     }
     if (base2 == null) base2 = priceByName.get(g.name) ?? null;
     if (base2 == null) continue;
+    const isSouvenir = /^Souvenir /.test(g.name);
     let stickerVal = 0;
-    for (const sn of g.stickers) {
+    if (!isSouvenir) for (const sn of g.stickers) {
       const sp = bulk.get(sn);
       if (sp && sp > 0) stickerVal += sp;
     }
