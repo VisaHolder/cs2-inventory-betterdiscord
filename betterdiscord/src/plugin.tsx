@@ -1800,7 +1800,7 @@ async function openInventoryModal(steamId: string, displayName: string) {
     const listEl = modal.querySelector<HTMLElement>(".vsi-modal-list")!;
     const searchEl = modal.querySelector<HTMLInputElement>(".vsi-modal-search")!;
     const sortEl = modal.querySelector<HTMLButtonElement>(".vsi-modal-sort")!;
-    totalEl.textContent = fmt(total, cur);
+    totalEl.textContent = items.length ? fmt(total, cur) : "";
     let sortMode: "value" | "name" = "value";
     let query = "";
 
