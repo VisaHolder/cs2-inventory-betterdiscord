@@ -2,7 +2,7 @@
  * @name SteamInventoryValue
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.1.0
+ * @version 1.2.0
  * @source https://github.com/VisaHolder/steam-inventory-value
  * @website https://github.com/VisaHolder/steam-inventory-value
  */

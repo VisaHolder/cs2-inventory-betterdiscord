@@ -28,10 +28,19 @@ Full guide: [`betterdiscord/README.md`](betterdiscord/README.md)
 ## Features
 
 - **Inventory value** on every profile — total in your currency (CSFloat prices + live FX), top items, item count
+- **Applied-sticker value** folded into each skin — a 4× Katowice holo can be worth more than the gun; grails flagged in the breakdown
 - **Doppler / Gamma Doppler phase pricing** — Ruby, Sapphire, Black Pearl, Emerald, Phase 1-4 (with the optional CSFloat key)
-- **Trade Offer + Steam Profile buttons**, auto-detected from a linked Steam or a trade URL in the bio
+- **Full breakdown** — click any card for a searchable, sortable list of every item with thumbnails; right-click a user for the same
+- **What changed** — each card shows items gained/dropped since last time
+- **Trade Offer + Steam Profile buttons**, auto-detected from a linked Steam or a shared/bio trade URL
 - **Shared cache** — once anyone prices a profile it loads instantly for everyone else, and phase-accurate prices propagate even to users without a key
 - 100% client-side; only your **public** SteamID and inventory value are ever shared — no Discord identity, no accounts
+
+## Commands
+
+- `/inventory` — price a user or Steam ref; posts publicly (labeled links) or as an only-you embed with clickable Steam / Trade links
+- `/leaderboard` — the richest CS2 inventories the addon has tracked
+- `/compare a b` — two inventories side by side, and who wins by how much
 
 ## Repo layout
 

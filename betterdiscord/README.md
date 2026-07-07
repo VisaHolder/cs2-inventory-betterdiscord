@@ -36,8 +36,12 @@ That is the only setting that ever needs a key — everything else works out of 
 ## What you get
 
 - Full inventory value in your currency (CSFloat prices + live FX)
+- Applied-sticker value folded into each skin (a 4× Katowice holo can outvalue the gun); grails flagged in the breakdown
 - Doppler / Gamma Doppler phase pricing (with the optional key) — Ruby, Sapphire, Black Pearl, Emerald, Phase 1-4
+- Click any card (or right-click a user) for a searchable, sortable breakdown of every item with thumbnails
+- "What changed" line showing items gained / dropped since last time
 - Send Trade Offer + Steam Profile buttons on profiles
+- Commands: `/inventory`, `/leaderboard`, `/compare`
 - Shared cache: once anyone prices a profile it loads instantly for everyone else, and phase-accurate prices propagate even to people without a key
 - 100% client-side. Only your public SteamID and inventory value are ever shared — no Discord identity, no accounts
 
