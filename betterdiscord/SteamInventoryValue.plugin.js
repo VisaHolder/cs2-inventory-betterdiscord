@@ -1871,13 +1871,10 @@ var scanScheduled = false;
 function scheduleScan() {
   if (scanScheduled || !observer) return;
   scanScheduled = true;
-  const run = () => {
+  requestAnimationFrame(() => {
     scanScheduled = false;
     if (observer) scan(document.body);
-  };
-  const ric = window.requestIdleCallback;
-  if (typeof ric === "function") ric(run, { timeout: 300 });
-  else setTimeout(run, 150);
+  });
 }
 function startObserver() {
   scanScheduled = false;

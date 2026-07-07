@@ -2120,10 +2120,9 @@ let scanScheduled = false;
 function scheduleScan() {
     if (scanScheduled || !observer) return;
     scanScheduled = true;
-    const run = () => { scanScheduled = false; if (observer) scan(document.body); };
-    const ric = (window as any).requestIdleCallback;
-    if (typeof ric === "function") ric(run, { timeout: 300 });
-    else setTimeout(run, 150);
+    // Next animation frame (~16ms), not requestIdleCallback — still collapses a burst of mutations
+    // into a single scan (the CPU win), but injects the card near-instantly so it never pops in.
+    requestAnimationFrame(() => { scanScheduled = false; if (observer) scan(document.body); });
 }
 
 function startObserver() {
