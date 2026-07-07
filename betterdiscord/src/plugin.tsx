@@ -391,17 +391,22 @@ async function getBulkPrices(source: string): Promise<PriceMap> {
 }
 
 function parseSteamPrice(raw: string): number {
-    // "$12.34" → 12.34, "12,34€" → 12.34, "1,234.56" → 1234.56
+    // Locale-agnostic: "$1,234.56" → 1234.56, "1.234,56€" → 1234.56, "12,34" → 12.34, "1,234" → 1234.
+    // The LAST '.'/',' is the decimal separator ONLY if it has 1-2 trailing digits; a lone separator
+    // with 3 trailing digits (and no other separator) is thousands grouping. All other separators
+    // are thousands grouping and are stripped.
     const cleaned = String(raw).replace(/[^\d.,]/g, "");
-    // If both . and , present, assume . is thousands: "1,234.56" → 1234.56
-    // If only , present, assume , is decimal: "12,34" → 12.34
+    if (!cleaned) return 0;
+    const lastDot = cleaned.lastIndexOf(".");
+    const lastComma = cleaned.lastIndexOf(",");
+    const lastSep = Math.max(lastDot, lastComma);
     let normalized: string;
-    if (cleaned.includes(".") && cleaned.includes(",")) {
-        normalized = cleaned.replace(/,/g, "");
-    } else if (cleaned.includes(",") && !cleaned.includes(".")) {
-        normalized = cleaned.replace(",", ".");
-    } else {
+    if (lastSep === -1) {
         normalized = cleaned;
+    } else if (cleaned.length - lastSep - 1 === 3 && (lastDot === -1 || lastComma === -1)) {
+        normalized = cleaned.replace(/[.,]/g, ""); // single separator, 3 trailing digits → thousands
+    } else {
+        normalized = cleaned.slice(0, lastSep).replace(/[.,]/g, "") + "." + cleaned.slice(lastSep + 1);
     }
     const n = parseFloat(normalized);
     return isFinite(n) ? n : 0;
@@ -409,7 +414,7 @@ function parseSteamPrice(raw: string): number {
 
 async function fetchSteamMarketPrice(marketHashName: string, currency: number): Promise<number> {
     const key = `${marketHashName}|${currency}`;
-    const ttl = (settings.store.priceCacheMinutes || 15) * 60_000;
+    const ttl = (settings.store.priceCacheMinutes || 60) * 60_000;
     const hit = priceMemo.get(key);
     if (hit && Date.now() - hit.ts < ttl) return hit.price;
 
@@ -1567,7 +1572,10 @@ function renderPricedCard(card: HTMLElement, latest: Snapshot, history: Snapshot
         if (d) {
             const cls = d.delta > 0 ? "up" : d.delta < 0 ? "down" : "";
             const sign = d.delta >= 0 ? "+" : "";
-            deltaHtml = `<span class="vsi-delta ${cls}">${sign}${fmt(d.delta, cur)}</span>`;
+            // Show the period the change is measured over (e.g. "+C$0.88 · 2h"), so it's clear
+            // it's the move since the last snapshot that old — not an arbitrary number.
+            const period = d.ago.replace(/\s*ago$/, "");
+            deltaHtml = `<span class="vsi-delta ${cls}" title="change since your snapshot ${d.ago}">${sign}${fmt(d.delta, cur)} · ${period}</span>`;
         }
     }
 

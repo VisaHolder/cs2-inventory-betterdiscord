@@ -363,20 +363,24 @@ async function getBulkPrices(source) {
 }
 function parseSteamPrice(raw) {
   const cleaned = String(raw).replace(/[^\d.,]/g, "");
+  if (!cleaned) return 0;
+  const lastDot = cleaned.lastIndexOf(".");
+  const lastComma = cleaned.lastIndexOf(",");
+  const lastSep = Math.max(lastDot, lastComma);
   let normalized;
-  if (cleaned.includes(".") && cleaned.includes(",")) {
-    normalized = cleaned.replace(/,/g, "");
-  } else if (cleaned.includes(",") && !cleaned.includes(".")) {
-    normalized = cleaned.replace(",", ".");
-  } else {
+  if (lastSep === -1) {
     normalized = cleaned;
+  } else if (cleaned.length - lastSep - 1 === 3 && (lastDot === -1 || lastComma === -1)) {
+    normalized = cleaned.replace(/[.,]/g, "");
+  } else {
+    normalized = cleaned.slice(0, lastSep).replace(/[.,]/g, "") + "." + cleaned.slice(lastSep + 1);
   }
   const n = parseFloat(normalized);
   return isFinite(n) ? n : 0;
 }
 async function fetchSteamMarketPrice(marketHashName, currency) {
   const key = `${marketHashName}|${currency}`;
-  const ttl = (settings.store.priceCacheMinutes || 15) * 6e4;
+  const ttl = (settings.store.priceCacheMinutes || 60) * 6e4;
   const hit = priceMemo.get(key);
   if (hit && Date.now() - hit.ts < ttl) return hit.price;
   const url = `https://steamcommunity.com/market/priceoverview/?country=US&currency=${currency}&appid=730&market_hash_name=${encodeURIComponent(marketHashName)}`;
@@ -1391,7 +1395,8 @@ function renderPricedCard(card, latest, history, changed) {
     if (d) {
       const cls = d.delta > 0 ? "up" : d.delta < 0 ? "down" : "";
       const sign = d.delta >= 0 ? "+" : "";
-      deltaHtml = `<span class="vsi-delta ${cls}">${sign}${fmt(d.delta, cur)}</span>`;
+      const period = d.ago.replace(/\s*ago$/, "");
+      deltaHtml = `<span class="vsi-delta ${cls}" title="change since your snapshot ${d.ago}">${sign}${fmt(d.delta, cur)} \xB7 ${period}</span>`;
     }
   }
   const shortSource = latest.source === "csfloat" ? "CSFloat" : latest.source === "skinport" ? "Skinport" : latest.source === "live_steam" ? "Steam Live" : latest.source;
