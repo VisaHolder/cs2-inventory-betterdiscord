@@ -756,6 +756,28 @@ async function cachePushInventory(steamId: string, snap: Snapshot): Promise<void
     } catch { /* cache is best-effort */ }
 }
 
+// Publish the local user's own trade URL to the shared cache, keyed by their SteamID (derived
+// from the URL's partner). Then every other addon user sees a Trade button on this person's
+// profile even if it isn't in their Discord bio. Best-effort; the worker verifies the partner.
+async function cachePushTradeUrl(): Promise<void> {
+    if (!settings.store.useSharedCache) return;
+    const tradeUrl = settings.store.tradeUrl?.trim();
+    if (!tradeUrl) return;
+    const steamId = steamIdFromTradeUrl(tradeUrl);
+    if (!steamId) return;
+    try {
+        await fetchJson(`${CACHE_WORKER}/trade/${steamId}`, { method: "POST", body: { trade_url: tradeUrl } });
+    } catch { /* best-effort */ }
+}
+
+async function cacheGetTradeUrl(steamId: string): Promise<string | null> {
+    if (!settings.store.useSharedCache) return null;
+    try {
+        const data: any = await fetchJson(`${CACHE_WORKER}/trade/${steamId}`);
+        return data?.found && typeof data.trade_url === "string" ? data.trade_url : null;
+    } catch { return null; }
+}
+
 function humanAgo(ms: number): string {
     const s = Math.round(ms / 1000);
     if (s < 60) return `${s}s ago`;
@@ -819,16 +841,20 @@ async function getTradeUrlForUser(userId: string): Promise<string | null> {
     return extractTradeUrl(bio ?? null);
 }
 
-function deriveSteamProfileUrl(tradeUrl: string): string | null {
+// SteamID64 a trade URL belongs to, from its `partner` (32-bit account id).
+function steamIdFromTradeUrl(tradeUrl: string): string | null {
     try {
-        const u = new URL(tradeUrl);
-        const partner = u.searchParams.get("partner");
+        const partner = new URL(tradeUrl).searchParams.get("partner");
         if (!partner || !/^\d+$/.test(partner)) return null;
-        const steamId64 = (76561197960265728n + BigInt(partner)).toString();
-        return `https://steamcommunity.com/profiles/${steamId64}`;
+        return (76561197960265728n + BigInt(partner)).toString();
     } catch {
         return null;
     }
+}
+
+function deriveSteamProfileUrl(tradeUrl: string): string | null {
+    const steamId64 = steamIdFromTradeUrl(tradeUrl);
+    return steamId64 ? `https://steamcommunity.com/profiles/${steamId64}` : null;
 }
 
 const BUTTON_CSS = `
@@ -1442,22 +1468,25 @@ function tryInject(panel: HTMLElement) {
     // fall back to an async fetch (with fade-in) only when the profile isn't loaded yet.
     if (!isOwn) {
         const sync = resolveForeignSync(shownId);
-        if (sync) {
+        if (sync?.tradeUrl) {
+            // Fast path: profile in memory AND a trade URL in the bio → render instantly, no flash.
             const row = buildForeignRow(sync.tradeUrl, sync.steamId);
             if (row) {
-                row.classList.add("instant"); // skip fade — resolved from cache, no delay to soften
+                row.classList.add("instant");
                 btn.insertBefore(row, btn.firstChild);
             }
         } else {
+            // Resolve the trade URL from bio, else the shared cache (owner-published), and the
+            // SteamID from their connection — so the Trade button shows even without it in the bio.
             (async () => {
-                const [bioTradeUrl, discordSteamId] = await Promise.all([
-                    getTradeUrlForUser(shownId).catch(e => { console.warn("[VSI] getTradeUrlForUser threw", e); return null as string | null; }),
-                    getSteamId(shownId).catch(e => { console.warn("[VSI] getSteamId threw", e); return null as string | null; }),
-                ]);
-                if (!bioTradeUrl && !discordSteamId) return;
+                const bioTradeUrl = sync ? sync.tradeUrl
+                    : await getTradeUrlForUser(shownId).catch(e => { console.warn("[VSI] getTradeUrlForUser threw", e); return null as string | null; });
+                const steamId = sync?.steamId ?? await getSteamId(shownId).catch(e => { console.warn("[VSI] getSteamId threw", e); return null as string | null; });
+                const tradeUrl = bioTradeUrl ?? (steamId ? await cacheGetTradeUrl(steamId).catch(() => null) : null);
+                if (!tradeUrl && !steamId) return;
                 if (!btn.isConnected) return;
                 if (btn.querySelector(".vsi-trade-row")) return;
-                const row = buildForeignRow(bioTradeUrl, discordSteamId);
+                const row = buildForeignRow(tradeUrl, steamId);
                 if (!row) return;
                 btn.insertBefore(row, btn.firstChild); // no .instant class → animation runs
             })().catch(e => console.error("[VSI] foreign row outer", e));
@@ -1553,7 +1582,12 @@ function buildSettingsPanel(): any {
     });
     return BD.UI.buildSettingsPanel({
         settings: items,
-        onChange: (_cat: any, id: string, value: any) => { (settings.store as any)[id] = value; },
+        onChange: (_cat: any, id: string, value: any) => {
+            (settings.store as any)[id] = value;
+            // Share your trade URL to the cache the moment you set it, so other addon users
+            // see a Trade button on your profile right away.
+            if (id === "tradeUrl" || id === "useSharedCache") cachePushTradeUrl().catch(() => { /* best-effort */ });
+        },
     });
 }
 
@@ -1601,9 +1635,11 @@ async function buildInventoryReply(args: any[]): Promise<{ content: string }> {
     }
 
     const cur = settings.store.marketCurrency || 1;
+    // Owner-published trade URL from the shared cache (null if they never set one).
+    const tradeUrl = (await cacheGetTradeUrl(steamId)) ?? undefined;
     // Cache-first for speed; else price via CSFloat (the slow live fallback is skipped in commands).
     const cached = await cacheGetInventory(steamId, cur);
-    if (cached) return { content: invMarkdown(displayName, cached, cur, steamId) };
+    if (cached) return { content: invMarkdown(displayName, cached, cur, steamId, tradeUrl) };
 
     const validSources = new Set(["csfloat", "skinport", "live_steam"]);
     const stored = settings.store.priceSource as string;
@@ -1611,7 +1647,7 @@ async function buildInventoryReply(args: any[]): Promise<{ content: string }> {
     const inv = await loadInventory(steamId, { source, useLiveFallback: false });
     if (inv.isPrivate) return { content: `**${displayName}**'s Steam inventory is private.` };
     cachePushInventory(steamId, { total: inv.total, priced: inv.priced, itemCount: inv.count, marketableCount: inv.marketableCount, uniqueNames: inv.uniqueNames, ts: Date.now(), source, currency: cur, topItems: inv.topItems });
-    return { content: invMarkdown(displayName, inv, cur, steamId) };
+    return { content: invMarkdown(displayName, inv, cur, steamId, tradeUrl) };
 }
 
 function registerCommands(): void {
@@ -1656,6 +1692,8 @@ module.exports = class SteamInventoryValue {
         try { ensureStyle(); } catch (e) { console.error("[VSI] ensureStyle", e); }
         try { startObserver(); } catch (e) { console.error("[VSI] startObserver", e); }
         try { registerCommands(); } catch (e) { console.error("[VSI] registerCommands", e); }
+        // Re-publish your trade URL each launch so it stays live in the shared cache.
+        try { cachePushTradeUrl().catch(() => { /* best-effort */ }); } catch (e) { console.error("[VSI] cachePushTradeUrl", e); }
     }
 
     stop() {

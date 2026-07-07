@@ -659,6 +659,26 @@ async function cachePushInventory(steamId, snap) {
   } catch {
   }
 }
+async function cachePushTradeUrl() {
+  if (!settings.store.useSharedCache) return;
+  const tradeUrl = settings.store.tradeUrl?.trim();
+  if (!tradeUrl) return;
+  const steamId = steamIdFromTradeUrl(tradeUrl);
+  if (!steamId) return;
+  try {
+    await fetchJson(`${CACHE_WORKER}/trade/${steamId}`, { method: "POST", body: { trade_url: tradeUrl } });
+  } catch {
+  }
+}
+async function cacheGetTradeUrl(steamId) {
+  if (!settings.store.useSharedCache) return null;
+  try {
+    const data = await fetchJson(`${CACHE_WORKER}/trade/${steamId}`);
+    return data?.found && typeof data.trade_url === "string" ? data.trade_url : null;
+  } catch {
+    return null;
+  }
+}
 function humanAgo(ms) {
   const s = Math.round(ms / 1e3);
   if (s < 60) return `${s}s ago`;
@@ -704,16 +724,18 @@ async function getTradeUrlForUser(userId) {
   }
   return extractTradeUrl(bio ?? null);
 }
-function deriveSteamProfileUrl(tradeUrl) {
+function steamIdFromTradeUrl(tradeUrl) {
   try {
-    const u = new URL(tradeUrl);
-    const partner = u.searchParams.get("partner");
+    const partner = new URL(tradeUrl).searchParams.get("partner");
     if (!partner || !/^\d+$/.test(partner)) return null;
-    const steamId64 = (76561197960265728n + BigInt(partner)).toString();
-    return `https://steamcommunity.com/profiles/${steamId64}`;
+    return (76561197960265728n + BigInt(partner)).toString();
   } catch {
     return null;
   }
+}
+function deriveSteamProfileUrl(tradeUrl) {
+  const steamId64 = steamIdFromTradeUrl(tradeUrl);
+  return steamId64 ? `https://steamcommunity.com/profiles/${steamId64}` : null;
 }
 var BUTTON_CSS = `
 .vsi-wrap {
@@ -1269,7 +1291,7 @@ function tryInject(panel) {
   target.parent.insertBefore(btn, target.before);
   if (!isOwn) {
     const sync = resolveForeignSync(shownId);
-    if (sync) {
+    if (sync?.tradeUrl) {
       const row = buildForeignRow(sync.tradeUrl, sync.steamId);
       if (row) {
         row.classList.add("instant");
@@ -1277,20 +1299,19 @@ function tryInject(panel) {
       }
     } else {
       (async () => {
-        const [bioTradeUrl, discordSteamId] = await Promise.all([
-          getTradeUrlForUser(shownId).catch((e) => {
-            console.warn("[VSI] getTradeUrlForUser threw", e);
-            return null;
-          }),
-          getSteamId(shownId).catch((e) => {
-            console.warn("[VSI] getSteamId threw", e);
-            return null;
-          })
-        ]);
-        if (!bioTradeUrl && !discordSteamId) return;
+        const bioTradeUrl = sync ? sync.tradeUrl : await getTradeUrlForUser(shownId).catch((e) => {
+          console.warn("[VSI] getTradeUrlForUser threw", e);
+          return null;
+        });
+        const steamId = sync?.steamId ?? await getSteamId(shownId).catch((e) => {
+          console.warn("[VSI] getSteamId threw", e);
+          return null;
+        });
+        const tradeUrl = bioTradeUrl ?? (steamId ? await cacheGetTradeUrl(steamId).catch(() => null) : null);
+        if (!tradeUrl && !steamId) return;
         if (!btn.isConnected) return;
         if (btn.querySelector(".vsi-trade-row")) return;
-        const row = buildForeignRow(bioTradeUrl, discordSteamId);
+        const row = buildForeignRow(tradeUrl, steamId);
         if (!row) return;
         btn.insertBefore(row, btn.firstChild);
       })().catch((e) => console.error("[VSI] foreign row outer", e));
@@ -1366,6 +1387,8 @@ function buildSettingsPanel() {
     settings: items,
     onChange: (_cat, id, value) => {
       settings.store[id] = value;
+      if (id === "tradeUrl" || id === "useSharedCache") cachePushTradeUrl().catch(() => {
+      });
     }
   });
 }
@@ -1404,15 +1427,16 @@ async function buildInventoryReply(args) {
     return { content: "Give me a **user** or a **steam** ref (URL / vanity / SteamID64)." };
   }
   const cur = settings.store.marketCurrency || 1;
+  const tradeUrl = await cacheGetTradeUrl(steamId) ?? void 0;
   const cached = await cacheGetInventory(steamId, cur);
-  if (cached) return { content: invMarkdown(displayName, cached, cur, steamId) };
+  if (cached) return { content: invMarkdown(displayName, cached, cur, steamId, tradeUrl) };
   const validSources = /* @__PURE__ */ new Set(["csfloat", "skinport", "live_steam"]);
   const stored = settings.store.priceSource;
   const source = validSources.has(stored) ? stored : "csfloat";
   const inv = await loadInventory(steamId, { source, useLiveFallback: false });
   if (inv.isPrivate) return { content: `**${displayName}**'s Steam inventory is private.` };
   cachePushInventory(steamId, { total: inv.total, priced: inv.priced, itemCount: inv.count, marketableCount: inv.marketableCount, uniqueNames: inv.uniqueNames, ts: Date.now(), source, currency: cur, topItems: inv.topItems });
-  return { content: invMarkdown(displayName, inv, cur, steamId) };
+  return { content: invMarkdown(displayName, inv, cur, steamId, tradeUrl) };
 }
 function registerCommands() {
   try {
@@ -1467,6 +1491,12 @@ module.exports = class SteamInventoryValue {
       registerCommands();
     } catch (e) {
       console.error("[VSI] registerCommands", e);
+    }
+    try {
+      cachePushTradeUrl().catch(() => {
+      });
+    } catch (e) {
+      console.error("[VSI] cachePushTradeUrl", e);
     }
   }
   stop() {
