@@ -1563,12 +1563,13 @@ type PricedLike = { total: number; priced: number; marketableCount?: number; uni
 function invMarkdown(displayName: string, r: PricedLike, cur: number): string {
     const top = r.topItems ?? [];
     const w = top.reduce((a, i) => Math.max(a, fmt(i.price, cur).length), 0);
-    const lines = top.map(i => `\`${fmt(i.price, cur).padStart(w)}\`  ${abbrevItem(i.name)}`).join("\n");
+    const rows = top.map(i => `${fmt(i.price, cur).padStart(w)}  ${abbrevItem(i.name)}`).join("\n");
     const untr = (r.skippedNonMarketable ?? 0) > 0 ? ` · ${r.skippedNonMarketable} untradeable` : "";
-    return `### 💼 ${displayName} — CS2 Inventory\n`
-        + `# ${fmt(r.total, cur)}\n`
-        + `-# ${r.priced}/${r.marketableCount ?? r.priced} priced · ${r.uniqueNames} unique${untr}\n`
-        + (lines ? `\n**Top items**\n${lines}` : "");
+    // Clean receipt: name + total on one header line, small subtext, then a single
+    // monospace block with right-aligned prices (no scattered code-span boxes).
+    return `## 💼 ${displayName} — ${fmt(r.total, cur)}\n`
+        + `-# ${r.priced}/${r.marketableCount ?? r.priced} priced · ${r.uniqueNames} unique${untr}`
+        + (rows ? `\n\`\`\`\n${rows}\n\`\`\`` : "");
 }
 
 // BetterDiscord sends whatever execute returns, so we build the reply and return { content }.

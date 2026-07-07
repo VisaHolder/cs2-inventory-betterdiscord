@@ -1372,14 +1372,13 @@ function buildSettingsPanel() {
 function invMarkdown(displayName, r, cur) {
   const top = r.topItems ?? [];
   const w = top.reduce((a, i) => Math.max(a, fmt(i.price, cur).length), 0);
-  const lines = top.map((i) => `\`${fmt(i.price, cur).padStart(w)}\`  ${abbrevItem(i.name)}`).join("\n");
+  const rows = top.map((i) => `${fmt(i.price, cur).padStart(w)}  ${abbrevItem(i.name)}`).join("\n");
   const untr = (r.skippedNonMarketable ?? 0) > 0 ? ` \xB7 ${r.skippedNonMarketable} untradeable` : "";
-  return `### \u{1F4BC} ${displayName} \u2014 CS2 Inventory
-# ${fmt(r.total, cur)}
--# ${r.priced}/${r.marketableCount ?? r.priced} priced \xB7 ${r.uniqueNames} unique${untr}
-` + (lines ? `
-**Top items**
-${lines}` : "");
+  return `## \u{1F4BC} ${displayName} \u2014 ${fmt(r.total, cur)}
+-# ${r.priced}/${r.marketableCount ?? r.priced} priced \xB7 ${r.uniqueNames} unique${untr}` + (rows ? `
+\`\`\`
+${rows}
+\`\`\`` : "");
 }
 async function buildInventoryReply(args) {
   const userId = args.find((a) => a.name === "user")?.value;
