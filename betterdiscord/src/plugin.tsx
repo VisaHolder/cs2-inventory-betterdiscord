@@ -239,9 +239,14 @@ const SETTINGS_SCHEMA: Record<string, any> = {
             { label: "10", value: 10 },
         ],
     },
+    showSparkline: {
+        type: OptionType.BOOLEAN,
+        description: "Show a mini price-history trend line on the card, drawn from your past snapshots (green when up, red when down).",
+        default: true,
+    },
     compactCard: {
         type: OptionType.BOOLEAN,
-        description: "Compact card — show just the total, delta and meta line; hide the top-items list (still one click away in the full breakdown).",
+        description: "Compact card — show just the total, delta, sparkline and meta line; hide the top-items list (still one click away in the full breakdown).",
         default: false,
     },
     autoRefreshStale: {
@@ -1127,6 +1132,14 @@ const BUTTON_CSS = `
 }
 .vsi-inv-card .vsi-delta.up { color: #4ade80; background: rgba(35,165,90,.15); }
 .vsi-inv-card .vsi-delta.down { color: #f87171; background: rgba(242,63,67,.15); }
+.vsi-inv-card .vsi-spark {
+    display: block;
+    width: 100%;
+    aspect-ratio: 240 / 30;
+    height: auto;
+    margin: 2px 0 8px;
+    overflow: visible;
+}
 .vsi-inv-card .vsi-meta {
     font-size: 11px;
     color: #b5bac1;
@@ -1581,6 +1594,33 @@ async function populateInventoryCard(card: HTMLElement, shownUserId: string, isO
     maybeAutoRefresh(card, latest, shownUserId, isOwn);
 }
 
+// Minimal price-history sparkline from a value series: gradient area fill, a crisp trend-colored
+// line, and a glowing endpoint dot. Green if the series rose overall, red if it fell.
+let sparkSeq = 0;
+function sparklineSvg(values: number[]): string {
+    if (values.length < 2) return "";
+    const W = 240, H = 30, px = 4, py = 6;
+    const min = Math.min(...values), max = Math.max(...values);
+    const range = max - min || 1;
+    const n = values.length;
+    const X = (i: number) => px + (i / (n - 1)) * (W - 2 * px);
+    const Y = (v: number) => H - py - ((v - min) / range) * (H - 2 * py);
+    const line = "M" + values.map((v, i) => `${X(i).toFixed(1)} ${Y(v).toFixed(1)}`).join(" L");
+    const area = `${line} L${X(n - 1).toFixed(1)} ${H} L${X(0).toFixed(1)} ${H} Z`;
+    const first = values[0], last = values[n - 1];
+    const color = last > first ? "#4ade80" : last < first ? "#f87171" : "#8b8f96";
+    const id = `vsg${sparkSeq++}`;
+    const lx = X(n - 1).toFixed(1), ly = Y(last).toFixed(1);
+    return `<svg class="vsi-spark" viewBox="0 0 ${W} ${H}">`
+        + `<defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">`
+        + `<stop offset="0" stop-color="${color}" stop-opacity="0.28"/>`
+        + `<stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>`
+        + `<path d="${area}" fill="url(#${id})"/>`
+        + `<path d="${line}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>`
+        + `<circle cx="${lx}" cy="${ly}" r="3.4" fill="${color}" opacity="0.22"/>`
+        + `<circle cx="${lx}" cy="${ly}" r="1.7" fill="${color}"/></svg>`;
+}
+
 // If auto-refresh is on and this snapshot is stale, silently re-price in the background and let
 // the refresh update the card in place. No loop: a successful re-price stamps a fresh ts.
 function maybeAutoRefresh(card: HTMLElement, latest: Snapshot, shownUserId: string, isOwn: boolean) {
@@ -1641,6 +1681,13 @@ function renderPricedCard(card: HTMLElement, latest: Snapshot, history: Snapshot
 
     const diffHtml = changed ? `<div class="vsi-diff">${escapeHtml(changed)}</div>` : "";
 
+    let sparkHtml = "";
+    if (settings.store.showSparkline !== false) {
+        // Chronological value series (oldest → newest) in the current currency only.
+        const series = [...history].reverse().concat(latest).filter(s => (s.currency || 1) === cur).map(s => s.total);
+        sparkHtml = sparklineSvg(series);
+    }
+
     card.innerHTML = `
         <div class="vsi-card-header">
             <span>💼 CS2 Inventory</span>
@@ -1650,6 +1697,7 @@ function renderPricedCard(card: HTMLElement, latest: Snapshot, history: Snapshot
             <span class="vsi-value">${fmt(latest.total, cur)}</span>
             ${deltaHtml}
         </div>
+        ${sparkHtml}
         <div class="vsi-meta">${shortSource} · ${humanAgo(ageMs)}${itemCountBit}${stickerSuffix(latest.stickerTotal, cur)}${staleTag}</div>
         ${topHtml}
         ${diffHtml}
