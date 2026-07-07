@@ -197,6 +197,11 @@ var SETTINGS_SCHEMA = {
     default: "",
     placeholder: "CSFloat API key"
   },
+  includeStickerValue: {
+    type: OptionType.BOOLEAN,
+    description: "Add applied-sticker value to each skin's price (a 4\xD7 Katowice holo can be worth more than the gun). Priced from the same market feed \u2014 no extra requests. Turn off for bare skin prices only.",
+    default: true
+  },
   useSharedCache: {
     type: OptionType.BOOLEAN,
     description: "Use the shared inventory-value cache. When on, once anyone has priced a profile it loads instantly for everyone else (and phase-accurate prices propagate to users without a CSFloat key). Only the public SteamID + inventory value is shared \u2014 no Discord identity. Turn off to price everything locally.",
@@ -387,6 +392,15 @@ async function fetchSteamMarketPrice(marketHashName, currency) {
   }
 }
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function parseStickers(desc) {
+  const out = [];
+  for (const e of desc?.descriptions ?? []) {
+    const v = e?.value;
+    if (typeof v !== "string" || !v.includes("Sticker:")) continue;
+    for (const m of v.matchAll(/title="Sticker: ([^"]+)"/g)) out.push(`Sticker | ${m[1]}`);
+  }
+  return out;
+}
 var dopplerIconMap = null;
 var dopplerMapPromise = null;
 async function getDopplerIconMap() {
@@ -449,6 +463,7 @@ async function loadInventory(steamId, opts) {
     isPrivate: isPriv,
     topItems: [],
     allItems: [],
+    stickerTotal: 0,
     unpriced: [],
     skippedNonMarketable: 0
   });
@@ -485,6 +500,7 @@ async function loadInventory(steamId, opts) {
   if (assets.length === 0) return empty(true);
   const inv = { assets, descriptions };
   const dopMap = await getDopplerIconMap();
+  const wantStickers = settings.store.includeStickerValue !== false;
   const metaByKey = /* @__PURE__ */ new Map();
   for (const d of inv.descriptions) {
     const name = d.market_hash_name;
@@ -494,7 +510,8 @@ async function loadInventory(steamId, opts) {
       marketable: d.marketable === 1 || d.marketable === "1",
       phase: dp?.phase ?? null,
       paintIndex: dp?.paintIndex ?? null,
-      icon: d.icon_url ?? ""
+      icon: d.icon_url ?? "",
+      stickers: wantStickers ? parseStickers(d) : []
     });
   }
   const groups = /* @__PURE__ */ new Map();
@@ -508,16 +525,18 @@ async function loadInventory(steamId, opts) {
       continue;
     }
     marketableCount++;
-    const gk = meta.phase ? `${meta.name}::${meta.phase}` : meta.name;
+    const stickerSig = meta.stickers.length ? meta.stickers.slice().sort().join("|") : "";
+    const gk = `${meta.name}::${meta.phase ?? ""}::${stickerSig}`;
     const g = groups.get(gk);
     if (g) g.qty++;
-    else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon });
+    else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon, stickers: meta.stickers });
   }
   const uniqueNames = [...new Set([...groups.values()].map((g) => g.name))];
   const priceByName = /* @__PURE__ */ new Map();
   const misses = [];
+  let bulk = /* @__PURE__ */ new Map();
   if (opts.source !== "live_steam") {
-    const bulk = await getBulkPrices(opts.source);
+    bulk = await getBulkPrices(opts.source);
     for (const name of uniqueNames) {
       const p = bulk.get(name);
       if (p && p > 0) priceByName.set(name, p);
@@ -527,31 +546,41 @@ async function loadInventory(steamId, opts) {
     misses.push(...uniqueNames);
   }
   const priceByGroup = /* @__PURE__ */ new Map();
+  const stickerByGroup = /* @__PURE__ */ new Map();
   const hasKey = !!(settings.store.csfloatApiKey || "").trim();
   for (const [gk, g] of groups) {
-    let p = null;
+    let base2 = null;
     if (g.phase && g.paintIndex != null && hasKey) {
-      p = await getCsfloatPhasePrice(g.name, g.paintIndex);
+      base2 = await getCsfloatPhasePrice(g.name, g.paintIndex);
       await sleep(350);
     }
-    if (p == null) p = priceByName.get(g.name) ?? null;
-    if (p != null) priceByGroup.set(gk, p);
+    if (base2 == null) base2 = priceByName.get(g.name) ?? null;
+    if (base2 == null) continue;
+    let stickerVal = 0;
+    for (const sn of g.stickers) {
+      const sp = bulk.get(sn);
+      if (sp && sp > 0) stickerVal += sp;
+    }
+    priceByGroup.set(gk, base2 + stickerVal);
+    if (stickerVal > 0) stickerByGroup.set(gk, { value: stickerVal, count: g.stickers.length });
   }
   const buildResult = () => {
     const unpriced = [];
     for (const [gk, g] of groups) if (!priceByGroup.has(gk)) unpriced.push(g.phase ? `${g.name} (${g.phase})` : g.name);
-    let total = 0, priced = 0;
+    let total = 0, priced = 0, stickerTotal = 0;
     const perItem = [];
     for (const [gk, g] of groups) {
       const p = priceByGroup.get(gk);
       if (p == null) continue;
       total += p * g.qty;
       priced += g.qty;
-      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon });
+      const sm = stickerByGroup.get(gk);
+      if (sm) stickerTotal += sm.value * g.qty;
+      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count });
     }
     perItem.sort((a, b) => b.price * b.qty - a.price * a.qty);
     const topItems = perItem.slice(0, 5).map((i) => ({ name: i.qty > 1 ? `${i.name} \xD7${i.qty}` : i.name, price: i.price * i.qty }));
-    return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
+    return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, stickerTotal, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
   };
   const shouldRunLive = opts.source === "live_steam" || opts.useLiveFallback && misses.length > 0;
   const runFallback = async () => {
@@ -1137,6 +1166,11 @@ var BUTTON_CSS = `
 }
 .vsi-modal-name { flex: 1; min-width: 0; font-size: 13px; color: #dbdee1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vsi-modal-qty { font-size: 11px; color: #949ba4; flex: none; }
+.vsi-modal-sticker {
+    font-size: 10px; font-weight: 600; flex: none; padding: 2px 6px; border-radius: 5px;
+    color: #57c2a0; background: rgba(87,194,160,.12); white-space: nowrap;
+}
+.vsi-modal-sticker.grail { color: #e6b800; background: rgba(230,184,0,.14); }
 .vsi-modal-price { font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; color: #f2f3f5; flex: none; }
 .vsi-modal-empty { padding: 28px 16px; text-align: center; color: #949ba4; font-size: 13px; }
 `;
@@ -1233,7 +1267,8 @@ async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
     ts: Date.now(),
     source,
     currency: cur,
-    topItems: r.topItems
+    topItems: r.topItems,
+    stickerTotal: r.stickerTotal
   });
   const saveItems = (r) => pushItemsSnap(steamId, { ts: Date.now(), currency: cur, total: r.total, items: r.allItems }).catch(() => {
   });
@@ -1354,7 +1389,7 @@ async function populateInventoryCard(card, shownUserId, isOwn) {
             <span class="vsi-value">${fmt(latest.total, cur)}</span>
             ${deltaHtml}
         </div>
-        <div class="vsi-meta">${shortSource} \xB7 ${humanAgo(ageMs)}${itemCountBit}${staleTag}</div>
+        <div class="vsi-meta">${shortSource} \xB7 ${humanAgo(ageMs)}${itemCountBit}${stickerSuffix(latest.stickerTotal, cur)}${staleTag}</div>
         ${topHtml}
         ${diffHtml}
     `;
@@ -1552,13 +1587,18 @@ async function openInventoryModal(steamId, displayName) {
   const render = () => {
     const filtered = items.filter((i) => !query || abbrevItem(i.name).toLowerCase().includes(query));
     filtered.sort((a, b) => sortMode === "value" ? b.price * b.qty - a.price * a.qty : abbrevItem(a.name).localeCompare(abbrevItem(b.name)));
-    const rows = filtered.map((i) => `
+    const rows = filtered.map((i) => {
+      const sv = (i.stickerValue ?? 0) * i.qty;
+      const badge = i.stickerCount ? `<span class="vsi-modal-sticker${sv >= 50 ? " grail" : ""}" title="${i.stickerCount} sticker${i.stickerCount > 1 ? "s" : ""}">+${fmt(sv, cur)}</span>` : "";
+      return `
             <div class="vsi-modal-row">
                 ${i.icon ? `<img class="vsi-modal-thumb" src="${steamThumb(i.icon)}" loading="lazy" />` : '<div class="vsi-modal-thumb"></div>'}
                 <span class="vsi-modal-name">${escapeHtml(abbrevItem(i.name))}</span>
+                ${badge}
                 ${i.qty > 1 ? `<span class="vsi-modal-qty">\xD7${i.qty}</span>` : ""}
                 <span class="vsi-modal-price">${fmt(i.price * i.qty, cur)}</span>
-            </div>`).join("");
+            </div>`;
+    }).join("");
     const noteHtml = note ? `<div class="vsi-modal-empty">${escapeHtml(note)}</div>` : "";
     if (!items.length) {
       listEl.innerHTML = '<div class="vsi-modal-empty">No snapshot yet \u2014 load this inventory from the profile card, then reopen.</div>';
@@ -1656,6 +1696,7 @@ function buildSettingsPanel() {
     }
   });
 }
+var stickerSuffix = (stickerTotal, cur) => stickerTotal && stickerTotal > 0 ? ` \xB7 incl. ${fmt(stickerTotal, cur)} stickers` : "";
 function invMarkdown(displayName, r, cur, steamId, tradeUrl, changed) {
   const top = r.topItems ?? [];
   const sym = currencySymbol(cur);
@@ -1668,7 +1709,7 @@ function invMarkdown(displayName, r, cur, steamId, tradeUrl, changed) {
     tradeUrl ? `Trade \xB7 <${tradeUrl}>` : ""
   ].filter(Boolean).join("\n-# ");
   return `## ${displayName} \u2014 ${fmt(r.total, cur)}
--# ${r.priced}/${r.marketableCount ?? r.priced} priced \xB7 ${r.uniqueNames} unique${untr}` + (changed ? `
+-# ${r.priced}/${r.marketableCount ?? r.priced} priced \xB7 ${r.uniqueNames} unique${untr}${stickerSuffix(r.stickerTotal, cur)}` + (changed ? `
 -# ${changed}` : "") + (body ? `
 \`\`\`
 ${body}
@@ -1685,7 +1726,7 @@ function invEmbed(displayName, r, cur, steamId, tradeUrl, changed) {
   const linkParts = [];
   if (steamId) linkParts.push(`[Steam Profile](https://steamcommunity.com/profiles/${steamId})`);
   if (tradeUrl) linkParts.push(`[Send Trade Offer](${tradeUrl})`);
-  let description = `${r.priced}/${r.marketableCount ?? r.priced} priced \xB7 ${r.uniqueNames} unique${untr}`;
+  let description = `${r.priced}/${r.marketableCount ?? r.priced} priced \xB7 ${r.uniqueNames} unique${untr}${stickerSuffix(r.stickerTotal, cur)}`;
   if (changed) description += `
 *${changed}*`;
   if (body) description += `

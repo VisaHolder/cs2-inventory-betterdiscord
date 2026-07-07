@@ -203,6 +203,11 @@ const SETTINGS_SCHEMA: Record<string, any> = {
         default: "",
         placeholder: "CSFloat API key",
     },
+    includeStickerValue: {
+        type: OptionType.BOOLEAN,
+        description: "Add applied-sticker value to each skin's price (a 4× Katowice holo can be worth more than the gun). Priced from the same market feed — no extra requests. Turn off for bare skin prices only.",
+        default: true,
+    },
     useSharedCache: {
         type: OptionType.BOOLEAN,
         description: "Use the shared inventory-value cache. When on, once anyone has priced a profile it loads instantly for everyone else (and phase-accurate prices propagate to users without a CSFloat key). Only the public SteamID + inventory value is shared — no Discord identity. Turn off to price everything locally.",
@@ -418,9 +423,10 @@ async function fetchSteamMarketPrice(marketHashName: string, currency: number): 
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// One priced line in an inventory. `icon` is the Steam icon_url hash (for thumbnails);
-// `qty` is how many identical copies. Used by the breakdown modal, diff, and sticker value.
-interface PricedItem { name: string; price: number; qty: number; icon?: string }
+// One priced line in an inventory. `price` is the per-copy value INCLUDING applied stickers;
+// `stickerValue`/`stickerCount` break out the sticker portion (for the badge). `icon` is the
+// Steam icon_url hash; `qty` is how many identical (same skin + same stickers) copies.
+interface PricedItem { name: string; price: number; qty: number; icon?: string; stickerValue?: number; stickerCount?: number }
 
 interface InventoryResult {
     total: number;
@@ -431,8 +437,21 @@ interface InventoryResult {
     isPrivate: boolean;
     topItems: { name: string; price: number }[];
     allItems: PricedItem[]; // full priced list, sorted by value desc — modal + diff
+    stickerTotal: number; // portion of `total` from applied stickers
     unpriced: string[]; // marketable but no price found
     skippedNonMarketable: number; // medals/coins/badges filtered out
+}
+
+// Applied stickers live in a description's HTML as <img title="Sticker: NAME">, one per copy
+// (duplicates repeat). The market name to price each is "Sticker | NAME".
+function parseStickers(desc: any): string[] {
+    const out: string[] = [];
+    for (const e of (desc?.descriptions ?? [])) {
+        const v = e?.value;
+        if (typeof v !== "string" || !v.includes("Sticker:")) continue;
+        for (const m of v.matchAll(/title="Sticker: ([^"]+)"/g)) out.push(`Sticker | ${m[1]}`);
+    }
+    return out;
 }
 
 interface PricingOptions {
@@ -508,7 +527,7 @@ async function getCsfloatPhasePrice(marketHashName: string, paintIndex: number):
 
 async function loadInventory(steamId: string, opts: PricingOptions): Promise<InventoryResult> {
     const empty = (isPriv: boolean): InventoryResult => ({
-        total: 0, priced: 0, count: 0, marketableCount: 0, uniqueNames: 0, isPrivate: isPriv, topItems: [], allItems: [], unpriced: [], skippedNonMarketable: 0,
+        total: 0, priced: 0, count: 0, marketableCount: 0, uniqueNames: 0, isPrivate: isPriv, topItems: [], allItems: [], stickerTotal: 0, unpriced: [], skippedNonMarketable: 0,
     });
 
     // Steam's inventory endpoint PAGINATES. Without an explicit count it returns only a partial
@@ -551,7 +570,8 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
     // We skip those entirely — otherwise we'd hit CSFloat/Steam for nothing and pad the "missing" list.
     // For Dopplers we also resolve the phase from the icon so a Ruby isn't priced as a Phase 3.
     const dopMap = await getDopplerIconMap();
-    interface Meta { name: string; marketable: boolean; phase: string | null; paintIndex: number | null; icon: string }
+    const wantStickers = settings.store.includeStickerValue !== false;
+    interface Meta { name: string; marketable: boolean; phase: string | null; paintIndex: number | null; icon: string; stickers: string[] }
     const metaByKey = new Map<string, Meta>();
     for (const d of inv.descriptions) {
         const name = d.market_hash_name;
@@ -562,11 +582,13 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
             phase: dp?.phase ?? null,
             paintIndex: dp?.paintIndex ?? null,
             icon: d.icon_url ?? "",
+            stickers: wantStickers ? parseStickers(d) : [],
         });
     }
 
-    // Group identical items. Dopplers group by name+phase so each phase is counted & priced on its own.
-    interface Group { name: string; phase: string | null; paintIndex: number | null; qty: number; icon: string }
+    // Group identical items. Dopplers group by name+phase; stickered copies group by their sticker
+    // set too, so a 4×-Katowice AK isn't averaged in with a bare one (each sticker set prices apart).
+    interface Group { name: string; phase: string | null; paintIndex: number | null; qty: number; icon: string; stickers: string[] }
     const groups = new Map<string, Group>();
     let marketableCount = 0;
     let skippedNonMarketable = 0;
@@ -575,18 +597,20 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         if (!meta) continue;
         if (!meta.marketable) { skippedNonMarketable++; continue; }
         marketableCount++;
-        const gk = meta.phase ? `${meta.name}::${meta.phase}` : meta.name;
+        const stickerSig = meta.stickers.length ? meta.stickers.slice().sort().join("|") : "";
+        const gk = `${meta.name}::${meta.phase ?? ""}::${stickerSig}`;
         const g = groups.get(gk);
         if (g) g.qty++;
-        else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon });
+        else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon, stickers: meta.stickers });
     }
     const uniqueNames = [...new Set([...groups.values()].map(g => g.name))];
 
     // ── Generic (name-keyed) pricing: bulk feed. Live Steam fills the misses later. ──
     const priceByName = new Map<string, number>();
     const misses: string[] = [];
+    let bulk: PriceMap = new Map();
     if (opts.source !== "live_steam") {
-        const bulk = await getBulkPrices(opts.source);
+        bulk = await getBulkPrices(opts.source);
         for (const name of uniqueNames) {
             const p = bulk.get(name);
             if (p && p > 0) priceByName.set(name, p);
@@ -596,35 +620,44 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         misses.push(...uniqueNames);
     }
 
-    // ── Per-group pricing (bulk + Doppler phase). Fast: no per-item Steam calls here. ──
+    // ── Per-group pricing (bulk + Doppler phase + applied stickers). Fast: no per-item Steam calls.
+    //    Sticker prices come from the same bulk feed (keyed "Sticker | NAME"), already in the user's
+    //    currency, and are added on top of the base skin price. ──
     const priceByGroup = new Map<string, number>();
+    const stickerByGroup = new Map<string, { value: number; count: number }>();
     const hasKey = !!(settings.store.csfloatApiKey || "").trim();
     for (const [gk, g] of groups) {
-        let p: number | null = null;
+        let base: number | null = null;
         if (g.phase && g.paintIndex != null && hasKey) {
-            p = await getCsfloatPhasePrice(g.name, g.paintIndex);
+            base = await getCsfloatPhasePrice(g.name, g.paintIndex);
             await sleep(350); // gentle on CSFloat's API
         }
-        if (p == null) p = priceByName.get(g.name) ?? null;
-        if (p != null) priceByGroup.set(gk, p);
+        if (base == null) base = priceByName.get(g.name) ?? null;
+        if (base == null) continue; // unpriced base → leave for the live fallback
+        let stickerVal = 0;
+        for (const sn of g.stickers) { const sp = bulk.get(sn); if (sp && sp > 0) stickerVal += sp; }
+        priceByGroup.set(gk, base + stickerVal);
+        if (stickerVal > 0) stickerByGroup.set(gk, { value: stickerVal, count: g.stickers.length });
     }
 
     // Assemble an InventoryResult from the current price maps (re-run after the fallback fills misses).
     const buildResult = (): InventoryResult => {
         const unpriced: string[] = [];
         for (const [gk, g] of groups) if (!priceByGroup.has(gk)) unpriced.push(g.phase ? `${g.name} (${g.phase})` : g.name);
-        let total = 0, priced = 0;
+        let total = 0, priced = 0, stickerTotal = 0;
         const perItem: PricedItem[] = [];
         for (const [gk, g] of groups) {
             const p = priceByGroup.get(gk);
             if (p == null) continue;
             total += p * g.qty;
             priced += g.qty;
-            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon });
+            const sm = stickerByGroup.get(gk);
+            if (sm) stickerTotal += sm.value * g.qty;
+            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count });
         }
         perItem.sort((a, b) => (b.price * b.qty) - (a.price * a.qty));
         const topItems = perItem.slice(0, 5).map(i => ({ name: i.qty > 1 ? `${i.name} ×${i.qty}` : i.name, price: i.price * i.qty }));
-        return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
+        return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, stickerTotal, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
     };
 
     // ── Live Steam Market fallback for CSFloat's misses (charms/passes/graffiti it doesn't list).
@@ -700,6 +733,7 @@ interface Snapshot {
     source: string;
     currency: number;
     topItems?: { name: string; price: number }[];
+    stickerTotal?: number; // portion of total from applied stickers (local snapshots only)
 }
 
 const snapKey = (steamId: string) => `vsi.snap.${steamId}`;
@@ -1276,6 +1310,11 @@ const BUTTON_CSS = `
 }
 .vsi-modal-name { flex: 1; min-width: 0; font-size: 13px; color: #dbdee1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vsi-modal-qty { font-size: 11px; color: #949ba4; flex: none; }
+.vsi-modal-sticker {
+    font-size: 10px; font-weight: 600; flex: none; padding: 2px 6px; border-radius: 5px;
+    color: #57c2a0; background: rgba(87,194,160,.12); white-space: nowrap;
+}
+.vsi-modal-sticker.grail { color: #e6b800; background: rgba(230,184,0,.14); }
 .vsi-modal-price { font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; color: #f2f3f5; flex: none; }
 .vsi-modal-empty { padding: 28px 16px; text-align: center; color: #949ba4; font-size: 13px; }
 `;
@@ -1388,6 +1427,7 @@ async function runInventoryForUser(shownUserId: string, onBackgroundUpdate?: () 
         source,
         currency: cur,
         topItems: r.topItems,
+        stickerTotal: r.stickerTotal,
     });
 
     const saveItems = (r: InventoryResult) =>
@@ -1529,7 +1569,7 @@ async function populateInventoryCard(card: HTMLElement, shownUserId: string, isO
             <span class="vsi-value">${fmt(latest.total, cur)}</span>
             ${deltaHtml}
         </div>
-        <div class="vsi-meta">${shortSource} · ${humanAgo(ageMs)}${itemCountBit}${staleTag}</div>
+        <div class="vsi-meta">${shortSource} · ${humanAgo(ageMs)}${itemCountBit}${stickerSuffix(latest.stickerTotal, cur)}${staleTag}</div>
         ${topHtml}
         ${diffHtml}
     `;
@@ -1769,13 +1809,20 @@ async function openInventoryModal(steamId: string, displayName: string) {
         filtered.sort((a, b) => sortMode === "value"
             ? (b.price * b.qty) - (a.price * a.qty)
             : abbrevItem(a.name).localeCompare(abbrevItem(b.name)));
-        const rows = filtered.map(i => `
+        const rows = filtered.map(i => {
+            const sv = (i.stickerValue ?? 0) * i.qty;
+            const badge = i.stickerCount
+                ? `<span class="vsi-modal-sticker${sv >= 50 ? " grail" : ""}" title="${i.stickerCount} sticker${i.stickerCount > 1 ? "s" : ""}">+${fmt(sv, cur)}</span>`
+                : "";
+            return `
             <div class="vsi-modal-row">
                 ${i.icon ? `<img class="vsi-modal-thumb" src="${steamThumb(i.icon)}" loading="lazy" />` : "<div class=\"vsi-modal-thumb\"></div>"}
                 <span class="vsi-modal-name">${escapeHtml(abbrevItem(i.name))}</span>
+                ${badge}
                 ${i.qty > 1 ? `<span class="vsi-modal-qty">×${i.qty}</span>` : ""}
                 <span class="vsi-modal-price">${fmt(i.price * i.qty, cur)}</span>
-            </div>`).join("");
+            </div>`;
+        }).join("");
         const noteHtml = note ? `<div class="vsi-modal-empty">${escapeHtml(note)}</div>` : "";
         if (!items.length) { listEl.innerHTML = "<div class=\"vsi-modal-empty\">No snapshot yet — load this inventory from the profile card, then reopen.</div>"; return; }
         if (!filtered.length) { listEl.innerHTML = "<div class=\"vsi-modal-empty\">No items match your search.</div>"; return; }
@@ -1870,7 +1917,11 @@ function buildSettingsPanel(): any {
 }
 
 // ─── /inventory slash command (BetterDiscord's BdApi.Commands) ──────────────────
-type PricedLike = { total: number; priced: number; marketableCount?: number; uniqueNames: number; topItems?: { name: string; price: number }[]; skippedNonMarketable?: number };
+type PricedLike = { total: number; priced: number; marketableCount?: number; uniqueNames: number; topItems?: { name: string; price: number }[]; skippedNonMarketable?: number; stickerTotal?: number };
+
+// " · incl. C$X stickers" when there's sticker value to call out, else "".
+const stickerSuffix = (stickerTotal: number | undefined, cur: number): string =>
+    stickerTotal && stickerTotal > 0 ? ` · incl. ${fmt(stickerTotal, cur)} stickers` : "";
 
 function invMarkdown(displayName: string, r: PricedLike, cur: number, steamId?: string, tradeUrl?: string, changed?: string): string {
     const top = r.topItems ?? [];
@@ -1888,7 +1939,7 @@ function invMarkdown(displayName: string, r: PricedLike, cur: number, steamId?: 
         tradeUrl ? `Trade · <${tradeUrl}>` : "",
     ].filter(Boolean).join("\n-# ");
     return `## ${displayName} — ${fmt(r.total, cur)}\n`
-        + `-# ${r.priced}/${r.marketableCount ?? r.priced} priced · ${r.uniqueNames} unique${untr}`
+        + `-# ${r.priced}/${r.marketableCount ?? r.priced} priced · ${r.uniqueNames} unique${untr}${stickerSuffix(r.stickerTotal, cur)}`
         + (changed ? `\n-# ${changed}` : "")
         + (body ? `\n\`\`\`\n${body}\n\`\`\`` : "")
         + (links ? `\n-# ${links}` : "");
@@ -1906,7 +1957,7 @@ function invEmbed(displayName: string, r: PricedLike, cur: number, steamId?: str
     const linkParts: string[] = [];
     if (steamId) linkParts.push(`[Steam Profile](https://steamcommunity.com/profiles/${steamId})`);
     if (tradeUrl) linkParts.push(`[Send Trade Offer](${tradeUrl})`);
-    let description = `${r.priced}/${r.marketableCount ?? r.priced} priced · ${r.uniqueNames} unique${untr}`;
+    let description = `${r.priced}/${r.marketableCount ?? r.priced} priced · ${r.uniqueNames} unique${untr}${stickerSuffix(r.stickerTotal, cur)}`;
     if (changed) description += `\n*${changed}*`;
     if (body) description += `\n\`\`\`\n${body}\n\`\`\``;
     if (linkParts.length) description += `\n${linkParts.join("  ·  ")}`;
