@@ -10,13 +10,15 @@ Real Doppler phase pricing · live prices in your currency · Trade Offer & Stea
 
 <br>
 
-<img src="docs/card.png" width="240" alt="Inventory card with price-history sparkline and top items" />
+<img src="docs/card.png" width="220" alt="Full card with top items" />
 &nbsp;
-<img src="docs/card-compact.png" width="240" alt="Compact card mode" />
+<img src="docs/card-compact.png" width="220" alt="Compact card" />
 &nbsp;
-<img src="docs/card-big.png" width="240" alt="A larger inventory with a downward trend" />
+<img src="docs/card-big.png" width="220" alt="Larger inventory, full card" />
+&nbsp;
+<img src="docs/card-big-compact.png" width="220" alt="Larger inventory, compact card" />
 
-<sub>The card on a profile — full with top items (left), compact mode (middle), and a larger inventory (right). The sparkline is green when the value's up, red when it's down.</sub>
+<sub>Each inventory shown two ways — <b>full</b> (with top items) and <b>compact</b> (total + sparkline only). The sparkline is green when the value's up, red when it's down.</sub>
 
 </div>
 
