@@ -254,6 +254,11 @@ const SETTINGS_SCHEMA: Record<string, any> = {
         description: "When you open a profile whose price is stale, silently re-price it in the background and update the card in place — no STALE tag, no manual refresh.",
         default: false,
     },
+    resetHistory: {
+        type: OptionType.BOOLEAN,
+        description: "Wipe all stored price snapshots (deltas, sparkline, and diff) for every profile and start fresh. Flip on to clear — it resets itself right after.",
+        default: false,
+    },
     showItemCount: {
         type: OptionType.BOOLEAN,
         description: 'Add "X items" to the card meta line.',
@@ -815,6 +820,22 @@ function sameOwned(a?: Record<string, number>, b?: Record<string, number>): bool
     if (ak.length !== Object.keys(b).length) return false;
     for (const k of ak) if (a[k] !== b[k]) return false;
     return true;
+}
+
+// Delete every stored snapshot/items key (all profiles). Goes through BdApi.Data so BetterDiscord's
+// in-memory cache is updated too — editing the config file directly gets clobbered on the next save.
+// Keys are enumerated from the on-disk config (which mirrors the cache) since BdApi.Data has no list().
+function clearAllHistory(): number {
+    try {
+        const fs = require("fs");
+        const folder = (BD as any).Plugins?.folder;
+        const cfg = folder ? `${folder}/${PLUGIN_NAME}.config.json` : null;
+        if (!cfg || !fs.existsSync(cfg)) return 0;
+        const data = JSON.parse(fs.readFileSync(cfg, "utf8"));
+        const keys = Object.keys(data).filter(k => k.startsWith("vsi.snap.") || k.startsWith("vsi.items."));
+        for (const k of keys) BD.Data.delete(PLUGIN_NAME, k);
+        return keys.length;
+    } catch (e) { console.error("[VSI] clearAllHistory", e); return 0; }
 }
 
 async function pushItemsSnap(steamId: string, snap: ItemsSnapshot) {
@@ -2066,6 +2087,11 @@ function buildSettingsPanel(): any {
             // Share your trade URL to the cache the moment you set it, so other addon users
             // see a Trade button on your profile right away.
             if (id === "tradeUrl" || id === "useSharedCache" || id === "shareTradeUrl") cachePushTradeUrl().catch(() => { /* best-effort */ });
+            if (id === "resetHistory" && value === true) {
+                const n = clearAllHistory();
+                (settings.store as any).resetHistory = false;
+                try { BD.UI?.showToast?.(`Cleared price history for ${n} profile${n === 1 ? "" : "s"}.`, { type: "success" }); } catch { /* */ }
+            }
         },
     });
 }
@@ -2304,6 +2330,14 @@ function unregisterCommands(): void {
 // ─── BetterDiscord plugin entry ─────────────────────────────────────────────
 module.exports = class SteamInventoryValue {
     start() {
+        // One-time: wipe pre-stable-pricing history (fallback/sticker/pass-inclusive snapshots that
+        // polluted deltas & sparklines). Runs once per install of this build.
+        try {
+            if (!BD.Data.load(PLUGIN_NAME, "vsi.histResetV1")) {
+                clearAllHistory();
+                BD.Data.save(PLUGIN_NAME, "vsi.histResetV1", true);
+            }
+        } catch (e) { console.error("[VSI] one-time history reset", e); }
         try { ensureStyle(); } catch (e) { console.error("[VSI] ensureStyle", e); }
         try { startObserver(); } catch (e) { console.error("[VSI] startObserver", e); }
         try { registerCommands(); } catch (e) { console.error("[VSI] registerCommands", e); }
