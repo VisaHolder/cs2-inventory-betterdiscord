@@ -2,7 +2,7 @@
  * @name SteamInventoryValue
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.0.0
+ * @version 1.1.0
  * @source https://github.com/VisaHolder/steam-inventory-value
  * @website https://github.com/VisaHolder/steam-inventory-value
  */
@@ -15,7 +15,9 @@ var { Webpack } = BD;
 var UserStore;
 var UserProfileStore;
 var SelectedGuildStore;
+var SelectedChannelStore;
 var RestAPI;
+var MessageActions;
 try {
   UserStore = Webpack.getStore("UserStore");
 } catch {
@@ -29,7 +31,15 @@ try {
 } catch {
 }
 try {
+  SelectedChannelStore = Webpack.getStore("SelectedChannelStore");
+} catch {
+}
+try {
   RestAPI = Webpack.getByKeys && Webpack.getByKeys("getAPIBaseURL", "get", "post") || Webpack.getModule((m) => m?.getAPIBaseURL && typeof m?.get === "function" && typeof m?.post === "function");
+} catch {
+}
+try {
+  MessageActions = Webpack.getByKeys && Webpack.getByKeys("sendMessage", "editMessage") || Webpack.getModule((m) => typeof m?.sendMessage === "function" && typeof m?.editMessage === "function");
 } catch {
 }
 async function fetchJson(url, opts) {
@@ -39,6 +49,11 @@ async function fetchJson(url, opts) {
   const res = await BD.Net.fetch(url, { method: opts?.method || "GET", headers, body: bodyStr });
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   return await res.json();
+}
+async function fetchText(url) {
+  const res = await BD.Net.fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return await res.text();
 }
 var OptionType = { STRING: "STRING", NUMBER: "NUMBER", BOOLEAN: "BOOLEAN", SELECT: "SELECT" };
 var loadSettings = () => BD.Data.load(PLUGIN_NAME, "settings") || {};
@@ -63,6 +78,44 @@ var DataStore = {
     BD.Data.save(PLUGIN_NAME, k, v);
   }
 };
+async function resolveSteamRef(input) {
+  let raw = input.trim().replace(/^@+/, "").replace(/\/+$/, "");
+  raw = raw.replace(/^<|>$/g, "");
+  let steamId = null;
+  if (/^7656\d{13}$/.test(raw)) steamId = raw;
+  if (!steamId) {
+    const m = raw.match(/[?&]partner=(\d+)/);
+    if (m) steamId = (76561197960265728n + BigInt(m[1])).toString();
+  }
+  if (!steamId) {
+    const m = raw.match(/\/profiles\/(7656\d{13})/);
+    if (m) steamId = m[1];
+  }
+  if (!steamId) {
+    let vanity = null;
+    const m = raw.match(/steamcommunity\.com\/id\/([^/?\s]+)/i);
+    if (m) vanity = m[1];
+    else if (!/[\s/]/.test(raw) && !/^\d+$/.test(raw)) vanity = raw;
+    if (vanity) {
+      try {
+        const xml = await fetchText(`https://steamcommunity.com/id/${encodeURIComponent(vanity)}/?xml=1`);
+        const m2 = xml.match(/<steamID64>(\d+)<\/steamID64>/);
+        if (m2) steamId = m2[1];
+      } catch (e) {
+        console.warn("[VSI] vanity resolve failed", e);
+      }
+    }
+  }
+  if (!steamId) return null;
+  try {
+    const xml = await fetchText(`https://steamcommunity.com/profiles/${steamId}/?xml=1`);
+    const persona = xml.match(/<steamID>(?:<!\[CDATA\[)?([^\]<]+?)(?:\]\]>)?<\/steamID>/)?.[1];
+    const avatar = xml.match(/<avatarFull>(?:<!\[CDATA\[)?([^\]<]+?)(?:\]\]>)?<\/avatarFull>/)?.[1];
+    return { steamId, persona: persona?.trim(), avatar: avatar?.trim() };
+  } catch {
+    return { steamId };
+  }
+}
 var SETTINGS_SCHEMA = {
   tradeUrl: {
     type: OptionType.STRING,
@@ -1316,16 +1369,107 @@ function buildSettingsPanel() {
     }
   });
 }
+function invMarkdown(displayName, r, cur) {
+  const top = r.topItems ?? [];
+  const w = top.reduce((a, i) => Math.max(a, fmt(i.price, cur).length), 0);
+  const lines = top.map((i) => `\`${fmt(i.price, cur).padStart(w)}\`  ${abbrevItem(i.name)}`).join("\n");
+  const untr = (r.skippedNonMarketable ?? 0) > 0 ? ` \xB7 ${r.skippedNonMarketable} untradeable` : "";
+  return `### \u{1F4BC} ${displayName} \u2014 CS2 Inventory
+# ${fmt(r.total, cur)}
+-# ${r.priced}/${r.marketableCount ?? r.priced} priced \xB7 ${r.uniqueNames} unique${untr}
+` + (lines ? `
+**Top items**
+${lines}` : "");
+}
+async function buildInventoryReply(args) {
+  const userId = args.find((a) => a.name === "user")?.value;
+  const steamRef = String(args.find((a) => a.name === "steam")?.value ?? "").trim();
+  let steamId = null;
+  let displayName = "CS2 Inventory";
+  if (userId) {
+    displayName = UserStore?.getUser?.(userId)?.username ?? "User";
+    steamId = await getSteamId(userId).catch(() => null);
+    if (!steamId) return { content: `**${displayName}** has no visible Steam account linked on Discord.` };
+  } else if (steamRef) {
+    const resolved = await resolveSteamRef(steamRef).catch(() => null);
+    if (!resolved) return { content: `Couldn't resolve **${steamRef}** to a Steam profile. Try a full URL, a vanity, or a raw SteamID64.` };
+    steamId = resolved.steamId;
+    displayName = resolved.persona ?? `SteamID ${resolved.steamId}`;
+  } else {
+    return { content: "Give me a **user** or a **steam** ref (URL / vanity / SteamID64)." };
+  }
+  const cur = settings.store.marketCurrency || 1;
+  const cached = await cacheGetInventory(steamId, cur);
+  if (cached) return { content: invMarkdown(displayName, cached, cur) };
+  const validSources = /* @__PURE__ */ new Set(["csfloat", "skinport", "live_steam"]);
+  const stored = settings.store.priceSource;
+  const source = validSources.has(stored) ? stored : "csfloat";
+  const inv = await loadInventory(steamId, { source, useLiveFallback: false });
+  if (inv.isPrivate) return { content: `**${displayName}**'s Steam inventory is private.` };
+  cachePushInventory(steamId, { total: inv.total, priced: inv.priced, itemCount: inv.count, marketableCount: inv.marketableCount, uniqueNames: inv.uniqueNames, ts: Date.now(), source, currency: cur, topItems: inv.topItems });
+  return { content: invMarkdown(displayName, inv, cur) };
+}
+function registerCommands() {
+  try {
+    BD.Commands?.register?.(PLUGIN_NAME, {
+      id: "inventory",
+      name: "inventory",
+      description: "Show a CS2 inventory value in chat \u2014 pick a user or paste a Steam ref",
+      options: [
+        { name: "user", description: "Discord user (uses their linked Steam)", type: 6, required: false },
+        { name: "steam", description: "OR a Steam profile URL / vanity / SteamID64", type: 3, required: false }
+      ],
+      execute: async (cmdArgs, ctx) => {
+        try {
+          const reply = await buildInventoryReply(cmdArgs ?? []);
+          if (settings.store.postPublicly && MessageActions?.sendMessage) {
+            const channelId = ctx?.channel?.id ?? SelectedChannelStore?.getChannelId?.();
+            if (channelId) {
+              MessageActions.sendMessage(channelId, { content: reply.content, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] }, void 0, { nonce: String(Date.now()) });
+              return;
+            }
+          }
+          return reply;
+        } catch (e) {
+          console.error("[VSI] /inventory", e);
+          return { content: "Error pricing that inventory \u2014 try again in a moment." };
+        }
+      }
+    });
+  } catch (e) {
+    console.warn("[VSI] command registration failed (BdApi.Commands unavailable?)", e);
+  }
+}
+function unregisterCommands() {
+  try {
+    BD.Commands?.unregisterAll?.(PLUGIN_NAME);
+  } catch {
+  }
+}
 module.exports = class SteamInventoryValue {
   start() {
-    ensureStyle();
-    startObserver();
+    try {
+      ensureStyle();
+    } catch (e) {
+      console.error("[VSI] ensureStyle", e);
+    }
+    try {
+      startObserver();
+    } catch (e) {
+      console.error("[VSI] startObserver", e);
+    }
+    try {
+      registerCommands();
+    } catch (e) {
+      console.error("[VSI] registerCommands", e);
+    }
   }
   stop() {
     observer?.disconnect();
     observer = null;
     styleEl?.remove();
     styleEl = null;
+    unregisterCommands();
     document.querySelectorAll('[data-vsi="1"]').forEach((n) => n.remove());
   }
   getSettingsPanel() {

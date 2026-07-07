@@ -15,13 +15,18 @@ const { Webpack } = BD;
 // Resolved defensively: a webpack lookup throwing (some Discord modules have
 // getters that throw when a filter touches them) must never stop the plugin
 // from loading. Anything that fails stays null and its feature degrades.
-let UserStore: any, UserProfileStore: any, SelectedGuildStore: any, RestAPI: any;
+let UserStore: any, UserProfileStore: any, SelectedGuildStore: any, SelectedChannelStore: any, RestAPI: any, MessageActions: any;
 try { UserStore = Webpack.getStore("UserStore"); } catch { /* */ }
 try { UserProfileStore = Webpack.getStore("UserProfileStore"); } catch { /* */ }
 try { SelectedGuildStore = Webpack.getStore("SelectedGuildStore"); } catch { /* */ }
+try { SelectedChannelStore = Webpack.getStore("SelectedChannelStore"); } catch { /* */ }
 try {
     RestAPI = (Webpack.getByKeys && Webpack.getByKeys("getAPIBaseURL", "get", "post"))
         || Webpack.getModule((m: any) => m?.getAPIBaseURL && typeof m?.get === "function" && typeof m?.post === "function");
+} catch { /* */ }
+try {
+    MessageActions = (Webpack.getByKeys && Webpack.getByKeys("sendMessage", "editMessage"))
+        || Webpack.getModule((m: any) => typeof m?.sendMessage === "function" && typeof m?.editMessage === "function");
 } catch { /* */ }
 
 // ── External HTTP. BdApi.Net.fetch is CSP-free (like Vencord's native helper),
@@ -1552,11 +1557,96 @@ function buildSettingsPanel(): any {
     });
 }
 
+// ─── /inventory slash command (BetterDiscord's BdApi.Commands) ──────────────────
+type PricedLike = { total: number; priced: number; marketableCount?: number; uniqueNames: number; topItems?: { name: string; price: number }[]; skippedNonMarketable?: number };
+
+function invMarkdown(displayName: string, r: PricedLike, cur: number): string {
+    const top = r.topItems ?? [];
+    const w = top.reduce((a, i) => Math.max(a, fmt(i.price, cur).length), 0);
+    const lines = top.map(i => `\`${fmt(i.price, cur).padStart(w)}\`  ${abbrevItem(i.name)}`).join("\n");
+    const untr = (r.skippedNonMarketable ?? 0) > 0 ? ` · ${r.skippedNonMarketable} untradeable` : "";
+    return `### 💼 ${displayName} — CS2 Inventory\n`
+        + `# ${fmt(r.total, cur)}\n`
+        + `-# ${r.priced}/${r.marketableCount ?? r.priced} priced · ${r.uniqueNames} unique${untr}\n`
+        + (lines ? `\n**Top items**\n${lines}` : "");
+}
+
+// BetterDiscord sends whatever execute returns, so we build the reply and return { content }.
+async function buildInventoryReply(args: any[]): Promise<{ content: string }> {
+    const userId = args.find((a: any) => a.name === "user")?.value as string | undefined;
+    const steamRef = String(args.find((a: any) => a.name === "steam")?.value ?? "").trim();
+
+    let steamId: string | null = null;
+    let displayName = "CS2 Inventory";
+    if (userId) {
+        displayName = UserStore?.getUser?.(userId)?.username ?? "User";
+        steamId = await getSteamId(userId).catch(() => null);
+        if (!steamId) return { content: `**${displayName}** has no visible Steam account linked on Discord.` };
+    } else if (steamRef) {
+        const resolved = await resolveSteamRef(steamRef).catch(() => null);
+        if (!resolved) return { content: `Couldn't resolve **${steamRef}** to a Steam profile. Try a full URL, a vanity, or a raw SteamID64.` };
+        steamId = resolved.steamId;
+        displayName = resolved.persona ?? `SteamID ${resolved.steamId}`;
+    } else {
+        return { content: "Give me a **user** or a **steam** ref (URL / vanity / SteamID64)." };
+    }
+
+    const cur = settings.store.marketCurrency || 1;
+    // Cache-first for speed; else price via CSFloat (the slow live fallback is skipped in commands).
+    const cached = await cacheGetInventory(steamId, cur);
+    if (cached) return { content: invMarkdown(displayName, cached, cur) };
+
+    const validSources = new Set(["csfloat", "skinport", "live_steam"]);
+    const stored = settings.store.priceSource as string;
+    const source = validSources.has(stored) ? stored : "csfloat";
+    const inv = await loadInventory(steamId, { source, useLiveFallback: false });
+    if (inv.isPrivate) return { content: `**${displayName}**'s Steam inventory is private.` };
+    cachePushInventory(steamId, { total: inv.total, priced: inv.priced, itemCount: inv.count, marketableCount: inv.marketableCount, uniqueNames: inv.uniqueNames, ts: Date.now(), source, currency: cur, topItems: inv.topItems });
+    return { content: invMarkdown(displayName, inv, cur) };
+}
+
+function registerCommands(): void {
+    try {
+        BD.Commands?.register?.(PLUGIN_NAME, {
+            id: "inventory",
+            name: "inventory",
+            description: "Show a CS2 inventory value in chat — pick a user or paste a Steam ref",
+            options: [
+                { name: "user", description: "Discord user (uses their linked Steam)", type: 6, required: false },
+                { name: "steam", description: "OR a Steam profile URL / vanity / SteamID64", type: 3, required: false },
+            ],
+            execute: async (cmdArgs: any[], ctx: any) => {
+                try {
+                    const reply = await buildInventoryReply(cmdArgs ?? []);
+                    // "Post Publicly" ON → actually send the message so everyone in the channel sees it.
+                    // OFF → return it, which BetterDiscord renders as an ephemeral "only you can see this".
+                    // "Post Publicly" ON → send a real message everyone sees. Discord silently drops a
+                    // sendMessage without a nonce, so one is always supplied. OFF (or no channel/module)
+                    // → return the content, which BetterDiscord renders as an ephemeral "only you" message.
+                    if (settings.store.postPublicly && MessageActions?.sendMessage) {
+                        const channelId = ctx?.channel?.id ?? SelectedChannelStore?.getChannelId?.();
+                        if (channelId) {
+                            MessageActions.sendMessage(channelId, { content: reply.content, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] }, undefined, { nonce: String(Date.now()) });
+                            return;
+                        }
+                    }
+                    return reply;
+                } catch (e) { console.error("[VSI] /inventory", e); return { content: "Error pricing that inventory — try again in a moment." }; }
+            },
+        });
+    } catch (e) { console.warn("[VSI] command registration failed (BdApi.Commands unavailable?)", e); }
+}
+
+function unregisterCommands(): void {
+    try { BD.Commands?.unregisterAll?.(PLUGIN_NAME); } catch { /* */ }
+}
+
 // ─── BetterDiscord plugin entry ─────────────────────────────────────────────
 module.exports = class SteamInventoryValue {
     start() {
-        ensureStyle();
-        startObserver();
+        try { ensureStyle(); } catch (e) { console.error("[VSI] ensureStyle", e); }
+        try { startObserver(); } catch (e) { console.error("[VSI] startObserver", e); }
+        try { registerCommands(); } catch (e) { console.error("[VSI] registerCommands", e); }
     }
 
     stop() {
@@ -1564,6 +1654,7 @@ module.exports = class SteamInventoryValue {
         observer = null;
         styleEl?.remove();
         styleEl = null;
+        unregisterCommands();
         document.querySelectorAll('[data-vsi="1"]').forEach(n => n.remove());
     }
 
