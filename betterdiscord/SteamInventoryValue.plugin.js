@@ -463,6 +463,7 @@ async function loadInventory(steamId, opts) {
     isPrivate: isPriv,
     topItems: [],
     allItems: [],
+    owned: {},
     stickerTotal: 0,
     unpriced: [],
     skippedNonMarketable: 0
@@ -515,6 +516,7 @@ async function loadInventory(steamId, opts) {
     });
   }
   const groups = /* @__PURE__ */ new Map();
+  const owned = /* @__PURE__ */ new Map();
   let marketableCount = 0;
   let skippedNonMarketable = 0;
   for (const a of inv.assets) {
@@ -525,6 +527,7 @@ async function loadInventory(steamId, opts) {
       continue;
     }
     marketableCount++;
+    owned.set(meta.name, (owned.get(meta.name) ?? 0) + 1);
     const stickerSig = meta.stickers.length ? meta.stickers.slice().sort().join("|") : "";
     const gk = `${meta.name}::${meta.phase ?? ""}::${stickerSig}`;
     const g = groups.get(gk);
@@ -581,7 +584,7 @@ async function loadInventory(steamId, opts) {
     }
     perItem.sort((a, b) => b.price * b.qty - a.price * a.qty);
     const topItems = perItem.slice(0, 5).map((i) => ({ name: i.qty > 1 ? `${i.name} \xD7${i.qty}` : i.name, price: i.price * i.qty }));
-    return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, stickerTotal, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
+    return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, owned: Object.fromEntries(owned), stickerTotal, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
   };
   const shouldRunLive = opts.source === "live_steam" || opts.useLiveFallback && misses.length > 0;
   const runFallback = async () => {
@@ -653,39 +656,46 @@ var itemsKey = (steamId) => `vsi.items.${steamId}`;
 async function getItemsSnaps(steamId) {
   return await DataStore.get(itemsKey(steamId)) ?? [];
 }
+function sameOwned(a, b) {
+  if (!a || !b) return false;
+  const ak = Object.keys(a);
+  if (ak.length !== Object.keys(b).length) return false;
+  for (const k of ak) if (a[k] !== b[k]) return false;
+  return true;
+}
 async function pushItemsSnap(steamId, snap) {
   const list = await getItemsSnaps(steamId);
   const prev = list[0];
-  if (prev && prev.total === snap.total && snap.ts - prev.ts < 30 * 6e4) {
+  if (prev && sameOwned(prev.owned, snap.owned)) {
     list[0] = snap;
   } else {
     list.unshift(snap);
   }
   await DataStore.set(itemsKey(steamId), list.slice(0, 3));
 }
-function diffItemLists(cur, prev) {
-  const prevQty = new Map(prev.items.map((i) => [i.name, i.qty]));
-  const curQty = new Map(cur.items.map((i) => [i.name, i.qty]));
-  const added = [];
-  const removed = [];
-  for (const i of cur.items) {
-    const gained = i.qty - (prevQty.get(i.name) ?? 0);
-    if (gained > 0) added.push({ ...i, qty: gained });
-  }
-  for (const i of prev.items) {
-    const lost = i.qty - (curQty.get(i.name) ?? 0);
-    if (lost > 0) removed.push({ ...i, qty: lost });
-  }
-  return { added, removed };
-}
 async function buildDiffLine(steamId) {
   const snaps = await getItemsSnaps(steamId);
   if (snaps.length < 2) return null;
   const [cur, prev] = snaps;
-  const { added, removed } = diffItemLists(cur, prev);
+  if (!cur.owned || !prev.owned) return null;
+  const priceOf = (name) => {
+    let best = 0;
+    for (const it of cur.items) if (it.name === name || it.name.startsWith(name)) best = Math.max(best, it.price);
+    return best;
+  };
+  const added = [];
+  const removed = [];
+  for (const [name, q] of Object.entries(cur.owned)) {
+    const d = q - (prev.owned[name] ?? 0);
+    if (d > 0) added.push({ name, qty: d, price: priceOf(name) });
+  }
+  for (const [name, q] of Object.entries(prev.owned)) {
+    const d = q - (cur.owned[name] ?? 0);
+    if (d > 0) removed.push({ name, qty: d, price: priceOf(name) });
+  }
   if (!added.length && !removed.length) return null;
   const label = (arr) => {
-    const top = arr.slice().sort((a, b) => b.price * b.qty - a.price * a.qty).slice(0, 2).map((i) => `${abbrevItem(i.name)}${i.qty > 1 ? ` \xD7${i.qty}` : ""}`);
+    const top = arr.slice().sort((a, b) => b.price - a.price).slice(0, 2).map((i) => `${abbrevItem(i.name)}${i.qty > 1 ? ` \xD7${i.qty}` : ""}`);
     return arr.length > 2 ? `${top.join(", ")} +${arr.length - 2} more` : top.join(", ");
   };
   const parts = [];
@@ -1253,12 +1263,15 @@ function escapeHtml(s) {
 async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
   const steamId = await getSteamId(shownUserId);
   if (!steamId) throw new Error("no-steam");
+  const name = UserStore?.getUser?.(shownUserId)?.username;
+  await priceSteamId(steamId, name, onBackgroundUpdate);
+}
+async function priceSteamId(steamId, name, onBackgroundUpdate) {
   const validSources = /* @__PURE__ */ new Set(["csfloat", "skinport", "live_steam"]);
   const stored = settings.store.priceSource;
   const source = validSources.has(stored) ? stored : "csfloat";
   const useLiveFallback = !!settings.store.useLiveSteamFallback;
   const cur = settings.store.marketCurrency || 1;
-  const name = UserStore?.getUser?.(shownUserId)?.username;
   const snapFrom = (r) => ({
     total: r.total,
     priced: r.priced,
@@ -1271,7 +1284,7 @@ async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
     topItems: r.topItems,
     stickerTotal: r.stickerTotal
   });
-  const saveItems = (r) => pushItemsSnap(steamId, { ts: Date.now(), currency: cur, total: r.total, items: r.allItems }).catch(() => {
+  const saveItems = (r) => pushItemsSnap(steamId, { ts: Date.now(), currency: cur, total: r.total, items: r.allItems, owned: r.owned }).catch(() => {
   });
   const onUpdate = onBackgroundUpdate ? (final) => {
     const s = snapFrom(final);
@@ -1288,6 +1301,7 @@ async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
   await pushSnapshot(steamId, snap);
   await saveItems(inv);
   cachePushInventory(steamId, snap, name);
+  return inv;
 }
 async function refreshCard(card, shownUserId, isOwn) {
   if (card.classList.contains("loading")) return;
@@ -1527,7 +1541,7 @@ function buildForeignRow(tradeUrl, steamId) {
   }
   return row.children.length ? row : null;
 }
-var steamThumb = (icon) => `https://community.cloudflare.steamstatic.com/economy/image/${icon}/48x48`;
+var steamThumb = (icon) => `https://community.akamai.steamstatic.com/economy/image/${icon}/48x48`;
 var modalKeyHandler = null;
 function closeInventoryModal() {
   document.querySelector(".vsi-modal-backdrop")?.remove();
@@ -1565,29 +1579,32 @@ async function openInventoryModal(steamId, displayName) {
     if (e.key === "Escape") closeInventoryModal();
   };
   document.addEventListener("keydown", modalKeyHandler);
-  const itemsSnap = (await getItemsSnaps(steamId))[0];
-  let items = itemsSnap?.items ?? [];
-  let total = itemsSnap?.total ?? 0;
-  let note = "";
-  if (!items.length) {
-    const snap = (await getSnapshots(steamId))[0] ?? await cacheGetInventory(steamId, cur);
-    if (snap?.topItems?.length) {
-      items = snap.topItems.map((t) => ({ name: t.name, price: t.price, qty: 1 }));
-      total = snap.total;
-      note = "Showing top items only \u2014 refresh the inventory card to load every item.";
-    }
-  }
-  if (!backdrop.isConnected) return;
   const totalEl = modal.querySelector(".vsi-modal-total");
   const listEl = modal.querySelector(".vsi-modal-list");
   const searchEl = modal.querySelector(".vsi-modal-search");
   const sortEl = modal.querySelector(".vsi-modal-sort");
-  totalEl.textContent = items.length ? fmt(total, cur) : "";
+  let items = [];
+  let total = 0;
+  let note = "";
+  let loading = true;
   let sortMode = "value";
   let query = "";
   const render = () => {
+    totalEl.textContent = items.length ? fmt(total, cur) : "";
+    if (loading) {
+      listEl.innerHTML = '<div class="vsi-modal-empty">Loading full inventory\u2026</div>';
+      return;
+    }
+    if (!items.length) {
+      listEl.innerHTML = `<div class="vsi-modal-empty">Couldn't load this inventory \u2014 it may be private.</div>`;
+      return;
+    }
     const filtered = items.filter((i) => !query || abbrevItem(i.name).toLowerCase().includes(query));
     filtered.sort((a, b) => sortMode === "value" ? b.price * b.qty - a.price * a.qty : abbrevItem(a.name).localeCompare(abbrevItem(b.name)));
+    if (!filtered.length) {
+      listEl.innerHTML = '<div class="vsi-modal-empty">No items match your search.</div>';
+      return;
+    }
     const rows = filtered.map((i) => {
       const sv = (i.stickerValue ?? 0) * i.qty;
       const badge = i.stickerCount ? `<span class="vsi-modal-sticker${sv >= 50 ? " grail" : ""}" title="${i.stickerCount} sticker${i.stickerCount > 1 ? "s" : ""}">+${fmt(sv, cur)}</span>` : "";
@@ -1600,18 +1617,8 @@ async function openInventoryModal(steamId, displayName) {
                 <span class="vsi-modal-price">${fmt(i.price * i.qty, cur)}</span>
             </div>`;
     }).join("");
-    const noteHtml = note ? `<div class="vsi-modal-empty">${escapeHtml(note)}</div>` : "";
-    if (!items.length) {
-      listEl.innerHTML = '<div class="vsi-modal-empty">No snapshot yet \u2014 load this inventory from the profile card, then reopen.</div>';
-      return;
-    }
-    if (!filtered.length) {
-      listEl.innerHTML = '<div class="vsi-modal-empty">No items match your search.</div>';
-      return;
-    }
-    listEl.innerHTML = noteHtml + rows;
+    listEl.innerHTML = (note ? `<div class="vsi-modal-empty">${escapeHtml(note)}</div>` : "") + rows;
   };
-  render();
   searchEl.addEventListener("input", () => {
     query = searchEl.value.trim().toLowerCase();
     render();
@@ -1621,7 +1628,44 @@ async function openInventoryModal(steamId, displayName) {
     sortEl.textContent = sortMode === "value" ? "Sort: Value" : "Sort: Name";
     render();
   });
+  render();
   searchEl.focus();
+  const local = (await getItemsSnaps(steamId))[0];
+  if (!backdrop.isConnected) return;
+  if (local?.items?.length) {
+    items = local.items;
+    total = local.total;
+    loading = false;
+    render();
+    return;
+  }
+  try {
+    const inv = await priceSteamId(steamId, void 0, () => {
+      getItemsSnaps(steamId).then((s) => {
+        if (backdrop.isConnected && s[0]?.items?.length) {
+          items = s[0].items;
+          total = s[0].total;
+          render();
+        }
+      }).catch(() => {
+      });
+    });
+    if (!backdrop.isConnected) return;
+    items = inv.allItems;
+    total = inv.total;
+    loading = false;
+    render();
+  } catch {
+    if (!backdrop.isConnected) return;
+    loading = false;
+    const snap = (await getSnapshots(steamId))[0] ?? await cacheGetInventory(steamId, cur);
+    if (snap?.topItems?.length) {
+      items = snap.topItems.map((t) => ({ name: t.name, price: t.price, qty: 1 }));
+      total = snap.total;
+      note = "Top items only \u2014 this inventory couldn't be fully loaded.";
+    }
+    render();
+  }
 }
 async function openInventoryModalForUser(shownUserId) {
   const steamId = await getSteamId(shownUserId);

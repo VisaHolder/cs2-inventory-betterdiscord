@@ -437,6 +437,7 @@ interface InventoryResult {
     isPrivate: boolean;
     topItems: { name: string; price: number }[];
     allItems: PricedItem[]; // full priced list, sorted by value desc — modal + diff
+    owned: Record<string, number>; // every marketable item by market_hash_name → qty (pricing-independent) — diff
     stickerTotal: number; // portion of `total` from applied stickers
     unpriced: string[]; // marketable but no price found
     skippedNonMarketable: number; // medals/coins/badges filtered out
@@ -527,7 +528,7 @@ async function getCsfloatPhasePrice(marketHashName: string, paintIndex: number):
 
 async function loadInventory(steamId: string, opts: PricingOptions): Promise<InventoryResult> {
     const empty = (isPriv: boolean): InventoryResult => ({
-        total: 0, priced: 0, count: 0, marketableCount: 0, uniqueNames: 0, isPrivate: isPriv, topItems: [], allItems: [], stickerTotal: 0, unpriced: [], skippedNonMarketable: 0,
+        total: 0, priced: 0, count: 0, marketableCount: 0, uniqueNames: 0, isPrivate: isPriv, topItems: [], allItems: [], owned: {}, stickerTotal: 0, unpriced: [], skippedNonMarketable: 0,
     });
 
     // Steam's inventory endpoint PAGINATES. Without an explicit count it returns only a partial
@@ -590,6 +591,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
     // set too, so a 4×-Katowice AK isn't averaged in with a bare one (each sticker set prices apart).
     interface Group { name: string; phase: string | null; paintIndex: number | null; qty: number; icon: string; stickers: string[] }
     const groups = new Map<string, Group>();
+    const owned = new Map<string, number>(); // every marketable item by name → qty, pricing-independent (diff)
     let marketableCount = 0;
     let skippedNonMarketable = 0;
     for (const a of inv.assets) {
@@ -597,6 +599,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         if (!meta) continue;
         if (!meta.marketable) { skippedNonMarketable++; continue; }
         marketableCount++;
+        owned.set(meta.name, (owned.get(meta.name) ?? 0) + 1);
         const stickerSig = meta.stickers.length ? meta.stickers.slice().sort().join("|") : "";
         const gk = `${meta.name}::${meta.phase ?? ""}::${stickerSig}`;
         const g = groups.get(gk);
@@ -660,7 +663,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         }
         perItem.sort((a, b) => (b.price * b.qty) - (a.price * a.qty));
         const topItems = perItem.slice(0, 5).map(i => ({ name: i.qty > 1 ? `${i.name} ×${i.qty}` : i.name, price: i.price * i.qty }));
-        return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, stickerTotal, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
+        return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, owned: Object.fromEntries(owned), stickerTotal, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
     };
 
     // ── Live Steam Market fallback for CSFloat's misses (charms/passes/graffiti it doesn't list).
@@ -754,52 +757,58 @@ async function pushSnapshot(steamId: string, snap: Snapshot) {
 // Full priced item lists are heavy (hundreds of entries), so they live apart from the light
 // snapshot history: we keep only the few most recent runs — [0] powers the breakdown modal,
 // [0] vs [1] powers the "what changed" diff.
-interface ItemsSnapshot { ts: number; currency: number; total: number; items: PricedItem[] }
+interface ItemsSnapshot { ts: number; currency: number; total: number; items: PricedItem[]; owned?: Record<string, number> }
 const itemsKey = (steamId: string) => `vsi.items.${steamId}`;
 
 async function getItemsSnaps(steamId: string): Promise<ItemsSnapshot[]> {
     return (await DataStore.get(itemsKey(steamId))) ?? [];
 }
 
+function sameOwned(a?: Record<string, number>, b?: Record<string, number>): boolean {
+    if (!a || !b) return false;
+    const ak = Object.keys(a);
+    if (ak.length !== Object.keys(b).length) return false;
+    for (const k of ak) if (a[k] !== b[k]) return false;
+    return true;
+}
+
 async function pushItemsSnap(steamId: string, snap: ItemsSnapshot) {
     const list = await getItemsSnaps(steamId);
-    // Skip near-duplicate runs (same total within a short window) so the diff compares
-    // meaningfully-different states, not two refreshes a minute apart.
+    // A new history entry only when the OWNED set actually changed — re-prices of the same
+    // inventory update the latest entry in place, so the diff spans real inventory changes.
     const prev = list[0];
-    if (prev && prev.total === snap.total && snap.ts - prev.ts < 30 * 60_000) {
-        list[0] = snap; // just refresh the timestamp/items in place
+    if (prev && sameOwned(prev.owned, snap.owned)) {
+        list[0] = snap;
     } else {
         list.unshift(snap);
     }
     await DataStore.set(itemsKey(steamId), list.slice(0, 3));
 }
 
-// "What changed" between the two most recent full-item snapshots: items/quantities gained vs
-// dropped. Returns a compact one-liner ("gained ★ Karambit ×1 · dropped AWP · 2d ago") or null.
-function diffItemLists(cur: ItemsSnapshot, prev: ItemsSnapshot): { added: PricedItem[]; removed: PricedItem[] } {
-    const prevQty = new Map(prev.items.map(i => [i.name, i.qty]));
-    const curQty = new Map(cur.items.map(i => [i.name, i.qty]));
-    const added: PricedItem[] = [];
-    const removed: PricedItem[] = [];
-    for (const i of cur.items) {
-        const gained = i.qty - (prevQty.get(i.name) ?? 0);
-        if (gained > 0) added.push({ ...i, qty: gained });
-    }
-    for (const i of prev.items) {
-        const lost = i.qty - (curQty.get(i.name) ?? 0);
-        if (lost > 0) removed.push({ ...i, qty: lost });
-    }
-    return { added, removed };
-}
-
+// "What changed" between the two most recent snapshots — compared on the OWNED item set
+// (every marketable item by name, independent of pricing), so items flipping in/out of the
+// PRICED subset (background Steam fallback, feed gaps, the sticker toggle) never show up as
+// phantom gains/losses. Only real inventory changes count. Returns null when nothing changed
+// or when a snapshot predates owned-tracking.
+type DiffEntry = { name: string; qty: number; price: number };
 async function buildDiffLine(steamId: string): Promise<string | null> {
     const snaps = await getItemsSnaps(steamId);
     if (snaps.length < 2) return null;
     const [cur, prev] = snaps;
-    const { added, removed } = diffItemLists(cur, prev);
+    if (!cur.owned || !prev.owned) return null; // pre-owned snapshot → can't diff reliably
+    // Best-effort price for a name, from the current run's priced items (for ordering the labels).
+    const priceOf = (name: string): number => {
+        let best = 0;
+        for (const it of cur.items) if (it.name === name || it.name.startsWith(name)) best = Math.max(best, it.price);
+        return best;
+    };
+    const added: DiffEntry[] = [];
+    const removed: DiffEntry[] = [];
+    for (const [name, q] of Object.entries(cur.owned)) { const d = q - (prev.owned[name] ?? 0); if (d > 0) added.push({ name, qty: d, price: priceOf(name) }); }
+    for (const [name, q] of Object.entries(prev.owned)) { const d = q - (cur.owned[name] ?? 0); if (d > 0) removed.push({ name, qty: d, price: priceOf(name) }); }
     if (!added.length && !removed.length) return null;
-    const label = (arr: PricedItem[]) => {
-        const top = arr.slice().sort((a, b) => (b.price * b.qty) - (a.price * a.qty)).slice(0, 2)
+    const label = (arr: DiffEntry[]) => {
+        const top = arr.slice().sort((a, b) => b.price - a.price).slice(0, 2)
             .map(i => `${abbrevItem(i.name)}${i.qty > 1 ? ` ×${i.qty}` : ""}`);
         return arr.length > 2 ? `${top.join(", ")} +${arr.length - 2} more` : top.join(", ");
     };
@@ -1408,35 +1417,32 @@ function escapeHtml(s: string): string {
     return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]!));
 }
 
-// Runs the same pricing pipeline as /inventory but for a given Discord user id, then persists a snapshot.
+// Runs the same pricing pipeline as /inventory for a Discord user id, then persists a snapshot.
 async function runInventoryForUser(shownUserId: string, onBackgroundUpdate?: () => void): Promise<void> {
     const steamId = await getSteamId(shownUserId);
     if (!steamId) throw new Error("no-steam");
+    const name = UserStore?.getUser?.(shownUserId)?.username;
+    await priceSteamId(steamId, name, onBackgroundUpdate);
+}
 
+// Prices a SteamID directly, persists the snapshot + full item list, shares to the cache, and
+// returns the result. `onBackgroundUpdate` (when given) runs the slow Steam fallback in the
+// background and fires once it lands. Used by the card, the modal, and the context menu.
+async function priceSteamId(steamId: string, name?: string, onBackgroundUpdate?: () => void): Promise<InventoryResult> {
     const validSources = new Set(["csfloat", "skinport", "live_steam"]);
     const stored = settings.store.priceSource as string;
     const source = validSources.has(stored) ? stored : "csfloat";
     const useLiveFallback = !!settings.store.useLiveSteamFallback;
     const cur = settings.store.marketCurrency || 1;
-    const name = UserStore?.getUser?.(shownUserId)?.username;
 
     const snapFrom = (r: InventoryResult): Snapshot => ({
-        total: r.total,
-        priced: r.priced,
-        itemCount: r.count,
-        marketableCount: r.marketableCount,
-        uniqueNames: r.uniqueNames,
-        ts: Date.now(),
-        source,
-        currency: cur,
-        topItems: r.topItems,
-        stickerTotal: r.stickerTotal,
+        total: r.total, priced: r.priced, itemCount: r.count, marketableCount: r.marketableCount,
+        uniqueNames: r.uniqueNames, ts: Date.now(), source, currency: cur, topItems: r.topItems, stickerTotal: r.stickerTotal,
     });
-
     const saveItems = (r: InventoryResult) =>
-        pushItemsSnap(steamId, { ts: Date.now(), currency: cur, total: r.total, items: r.allItems }).catch(() => { /* */ });
+        pushItemsSnap(steamId, { ts: Date.now(), currency: cur, total: r.total, items: r.allItems, owned: r.owned }).catch(() => { /* */ });
 
-    // When the background Steam fallback finishes, persist the fuller total, share it, re-render.
+    // When the background Steam fallback finishes, persist the fuller total, share it, notify.
     const onUpdate = onBackgroundUpdate
         ? (final: InventoryResult) => {
             const s = snapFrom(final);
@@ -1450,6 +1456,7 @@ async function runInventoryForUser(shownUserId: string, onBackgroundUpdate?: () 
     await pushSnapshot(steamId, snap);
     await saveItems(inv);
     cachePushInventory(steamId, snap, name); // share to the read-through cache (best-effort)
+    return inv;
 }
 
 async function refreshCard(card: HTMLElement, shownUserId: string, isOwn: boolean) {
@@ -1748,7 +1755,8 @@ function buildForeignRow(tradeUrl: string | null, steamId: string | null): HTMLE
 }
 
 // ─── Full breakdown modal ──────────────────────────────────────────────────────
-const steamThumb = (icon: string) => `https://community.cloudflare.steamstatic.com/economy/image/${icon}/48x48`;
+// Steam economy thumbnail. The akamai host serves the image directly (the cloudflare host 301-redirects).
+const steamThumb = (icon: string) => `https://community.akamai.steamstatic.com/economy/image/${icon}/48x48`;
 
 let modalKeyHandler: ((e: KeyboardEvent) => void) | null = null;
 function closeInventoryModal() {
@@ -1784,34 +1792,26 @@ async function openInventoryModal(steamId: string, displayName: string) {
     modalKeyHandler = (e: KeyboardEvent) => { if (e.key === "Escape") closeInventoryModal(); };
     document.addEventListener("keydown", modalKeyHandler);
 
-    // Resolve items: local full list → local snapshot top items → shared cache top items.
-    const itemsSnap = (await getItemsSnaps(steamId))[0];
-    let items: PricedItem[] = itemsSnap?.items ?? [];
-    let total = itemsSnap?.total ?? 0;
-    let note = "";
-    if (!items.length) {
-        const snap = (await getSnapshots(steamId))[0] ?? await cacheGetInventory(steamId, cur);
-        if (snap?.topItems?.length) {
-            items = snap.topItems.map(t => ({ name: t.name, price: t.price, qty: 1 }));
-            total = snap.total;
-            note = "Showing top items only — refresh the inventory card to load every item.";
-        }
-    }
-    if (!backdrop.isConnected) return; // user closed it while we resolved
-
     const totalEl = modal.querySelector<HTMLElement>(".vsi-modal-total")!;
     const listEl = modal.querySelector<HTMLElement>(".vsi-modal-list")!;
     const searchEl = modal.querySelector<HTMLInputElement>(".vsi-modal-search")!;
     const sortEl = modal.querySelector<HTMLButtonElement>(".vsi-modal-sort")!;
-    totalEl.textContent = items.length ? fmt(total, cur) : "";
+    let items: PricedItem[] = [];
+    let total = 0;
+    let note = "";
+    let loading = true;
     let sortMode: "value" | "name" = "value";
     let query = "";
 
     const render = () => {
+        totalEl.textContent = items.length ? fmt(total, cur) : "";
+        if (loading) { listEl.innerHTML = "<div class=\"vsi-modal-empty\">Loading full inventory…</div>"; return; }
+        if (!items.length) { listEl.innerHTML = "<div class=\"vsi-modal-empty\">Couldn't load this inventory — it may be private.</div>"; return; }
         const filtered = items.filter(i => !query || abbrevItem(i.name).toLowerCase().includes(query));
         filtered.sort((a, b) => sortMode === "value"
             ? (b.price * b.qty) - (a.price * a.qty)
             : abbrevItem(a.name).localeCompare(abbrevItem(b.name)));
+        if (!filtered.length) { listEl.innerHTML = "<div class=\"vsi-modal-empty\">No items match your search.</div>"; return; }
         const rows = filtered.map(i => {
             const sv = (i.stickerValue ?? 0) * i.qty;
             const badge = i.stickerCount
@@ -1826,12 +1826,8 @@ async function openInventoryModal(steamId: string, displayName: string) {
                 <span class="vsi-modal-price">${fmt(i.price * i.qty, cur)}</span>
             </div>`;
         }).join("");
-        const noteHtml = note ? `<div class="vsi-modal-empty">${escapeHtml(note)}</div>` : "";
-        if (!items.length) { listEl.innerHTML = "<div class=\"vsi-modal-empty\">No snapshot yet — load this inventory from the profile card, then reopen.</div>"; return; }
-        if (!filtered.length) { listEl.innerHTML = "<div class=\"vsi-modal-empty\">No items match your search.</div>"; return; }
-        listEl.innerHTML = noteHtml + rows;
+        listEl.innerHTML = (note ? `<div class="vsi-modal-empty">${escapeHtml(note)}</div>` : "") + rows;
     };
-    render();
 
     searchEl.addEventListener("input", () => { query = searchEl.value.trim().toLowerCase(); render(); });
     sortEl.addEventListener("click", () => {
@@ -1839,7 +1835,38 @@ async function openInventoryModal(steamId: string, displayName: string) {
         sortEl.textContent = sortMode === "value" ? "Sort: Value" : "Sort: Name";
         render();
     });
+    render();
     searchEl.focus();
+
+    // Data: use the local full list if we have it; otherwise price it now so every item shows
+    // with its thumbnail (instead of an icon-less "top items only" summary).
+    const local = (await getItemsSnaps(steamId))[0];
+    if (!backdrop.isConnected) return;
+    if (local?.items?.length) {
+        items = local.items; total = local.total; loading = false; render();
+        return;
+    }
+    try {
+        const inv = await priceSteamId(steamId, undefined, () => {
+            // Background Steam fallback landed → re-render with the fuller list.
+            getItemsSnaps(steamId).then(s => {
+                if (backdrop.isConnected && s[0]?.items?.length) { items = s[0].items; total = s[0].total; render(); }
+            }).catch(() => { /* */ });
+        });
+        if (!backdrop.isConnected) return;
+        items = inv.allItems; total = inv.total; loading = false; render();
+    } catch {
+        if (!backdrop.isConnected) return;
+        loading = false;
+        // Private / failed → show whatever summary we already have (top items, no thumbnails).
+        const snap = (await getSnapshots(steamId))[0] ?? await cacheGetInventory(steamId, cur);
+        if (snap?.topItems?.length) {
+            items = snap.topItems.map(t => ({ name: t.name, price: t.price, qty: 1 }));
+            total = snap.total;
+            note = "Top items only — this inventory couldn't be fully loaded.";
+        }
+        render();
+    }
 }
 
 async function openInventoryModalForUser(shownUserId: string) {
