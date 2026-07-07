@@ -418,6 +418,10 @@ async function fetchSteamMarketPrice(marketHashName: string, currency: number): 
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
+// One priced line in an inventory. `icon` is the Steam icon_url hash (for thumbnails);
+// `qty` is how many identical copies. Used by the breakdown modal, diff, and sticker value.
+interface PricedItem { name: string; price: number; qty: number; icon?: string }
+
 interface InventoryResult {
     total: number;
     priced: number;
@@ -426,6 +430,7 @@ interface InventoryResult {
     uniqueNames: number; // distinct marketable market_hash_names
     isPrivate: boolean;
     topItems: { name: string; price: number }[];
+    allItems: PricedItem[]; // full priced list, sorted by value desc — modal + diff
     unpriced: string[]; // marketable but no price found
     skippedNonMarketable: number; // medals/coins/badges filtered out
 }
@@ -503,7 +508,7 @@ async function getCsfloatPhasePrice(marketHashName: string, paintIndex: number):
 
 async function loadInventory(steamId: string, opts: PricingOptions): Promise<InventoryResult> {
     const empty = (isPriv: boolean): InventoryResult => ({
-        total: 0, priced: 0, count: 0, marketableCount: 0, uniqueNames: 0, isPrivate: isPriv, topItems: [], unpriced: [], skippedNonMarketable: 0,
+        total: 0, priced: 0, count: 0, marketableCount: 0, uniqueNames: 0, isPrivate: isPriv, topItems: [], allItems: [], unpriced: [], skippedNonMarketable: 0,
     });
 
     // Steam's inventory endpoint PAGINATES. Without an explicit count it returns only a partial
@@ -546,7 +551,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
     // We skip those entirely — otherwise we'd hit CSFloat/Steam for nothing and pad the "missing" list.
     // For Dopplers we also resolve the phase from the icon so a Ruby isn't priced as a Phase 3.
     const dopMap = await getDopplerIconMap();
-    interface Meta { name: string; marketable: boolean; phase: string | null; paintIndex: number | null }
+    interface Meta { name: string; marketable: boolean; phase: string | null; paintIndex: number | null; icon: string }
     const metaByKey = new Map<string, Meta>();
     for (const d of inv.descriptions) {
         const name = d.market_hash_name;
@@ -556,11 +561,12 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
             marketable: d.marketable === 1 || d.marketable === "1",
             phase: dp?.phase ?? null,
             paintIndex: dp?.paintIndex ?? null,
+            icon: d.icon_url ?? "",
         });
     }
 
     // Group identical items. Dopplers group by name+phase so each phase is counted & priced on its own.
-    interface Group { name: string; phase: string | null; paintIndex: number | null; qty: number }
+    interface Group { name: string; phase: string | null; paintIndex: number | null; qty: number; icon: string }
     const groups = new Map<string, Group>();
     let marketableCount = 0;
     let skippedNonMarketable = 0;
@@ -572,7 +578,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         const gk = meta.phase ? `${meta.name}::${meta.phase}` : meta.name;
         const g = groups.get(gk);
         if (g) g.qty++;
-        else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1 });
+        else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon });
     }
     const uniqueNames = [...new Set([...groups.values()].map(g => g.name))];
 
@@ -608,17 +614,17 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         const unpriced: string[] = [];
         for (const [gk, g] of groups) if (!priceByGroup.has(gk)) unpriced.push(g.phase ? `${g.name} (${g.phase})` : g.name);
         let total = 0, priced = 0;
-        const perItem: { name: string; price: number; qty: number }[] = [];
+        const perItem: PricedItem[] = [];
         for (const [gk, g] of groups) {
             const p = priceByGroup.get(gk);
             if (p == null) continue;
             total += p * g.qty;
             priced += g.qty;
-            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty });
+            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon });
         }
         perItem.sort((a, b) => (b.price * b.qty) - (a.price * a.qty));
         const topItems = perItem.slice(0, 5).map(i => ({ name: i.qty > 1 ? `${i.name} ×${i.qty}` : i.name, price: i.price * i.qty }));
-        return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
+        return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
     };
 
     // ── Live Steam Market fallback for CSFloat's misses (charms/passes/graffiti it doesn't list).
@@ -708,6 +714,29 @@ async function pushSnapshot(steamId: string, snap: Snapshot) {
     await DataStore.set(snapKey(steamId), list.slice(0, 20));
 }
 
+// Full priced item lists are heavy (hundreds of entries), so they live apart from the light
+// snapshot history: we keep only the few most recent runs — [0] powers the breakdown modal,
+// [0] vs [1] powers the "what changed" diff.
+interface ItemsSnapshot { ts: number; currency: number; total: number; items: PricedItem[] }
+const itemsKey = (steamId: string) => `vsi.items.${steamId}`;
+
+async function getItemsSnaps(steamId: string): Promise<ItemsSnapshot[]> {
+    return (await DataStore.get(itemsKey(steamId))) ?? [];
+}
+
+async function pushItemsSnap(steamId: string, snap: ItemsSnapshot) {
+    const list = await getItemsSnaps(steamId);
+    // Skip near-duplicate runs (same total within a short window) so the diff compares
+    // meaningfully-different states, not two refreshes a minute apart.
+    const prev = list[0];
+    if (prev && prev.total === snap.total && snap.ts - prev.ts < 30 * 60_000) {
+        list[0] = snap; // just refresh the timestamp/items in place
+    } else {
+        list.unshift(snap);
+    }
+    await DataStore.set(itemsKey(steamId), list.slice(0, 3));
+}
+
 // ─── Shared inventory-value cache (SteamID-keyed, USD-canonical) ────────────────
 // Read-through cache: once anyone prices a profile, everyone else loads it instantly,
 // and phase-accurate Doppler prices (from whoever holds a CSFloat key) propagate to
@@ -742,7 +771,7 @@ async function cacheGetInventory(steamId: string, cur: number): Promise<Snapshot
     } catch { return null; }
 }
 
-async function cachePushInventory(steamId: string, snap: Snapshot): Promise<void> {
+async function cachePushInventory(steamId: string, snap: Snapshot, name?: string): Promise<void> {
     if (!settings.store.useSharedCache) return;
     try {
         const fx = await fxFor(snap.currency || 1);
@@ -756,9 +785,20 @@ async function cachePushInventory(steamId: string, snap: Snapshot): Promise<void
                 marketable_count: snap.marketableCount ?? 0,
                 unique_names: snap.uniqueNames,
                 top_items: (snap.topItems ?? []).map(t => ({ name: t.name, price_usd: t.price / fx })),
+                ...(name ? { name } : {}),
             },
         });
     } catch { /* cache is best-effort */ }
+}
+
+// Global leaderboard of the richest cached inventories (USD-canonical → local FX at render).
+async function cacheGetLeaderboard(limit: number, cur: number): Promise<{ steamId: string; total: number; name?: string }[]> {
+    try {
+        const data: any = await fetchJson(`${CACHE_WORKER}/leaderboard?limit=${limit}`);
+        const entries: any[] = Array.isArray(data?.entries) ? data.entries : [];
+        const fx = await fxFor(cur);
+        return entries.map(e => ({ steamId: String(e.steamId), total: (e.total_usd ?? 0) * fx, name: e.name }));
+    } catch { return []; }
 }
 
 // Publish the local user's own trade URL to the shared cache, keyed by their SteamID (derived
@@ -1234,6 +1274,7 @@ async function runInventoryForUser(shownUserId: string, onBackgroundUpdate?: () 
     const source = validSources.has(stored) ? stored : "csfloat";
     const useLiveFallback = !!settings.store.useLiveSteamFallback;
     const cur = settings.store.marketCurrency || 1;
+    const name = UserStore?.getUser?.(shownUserId)?.username;
 
     const snapFrom = (r: InventoryResult): Snapshot => ({
         total: r.total,
@@ -1247,11 +1288,14 @@ async function runInventoryForUser(shownUserId: string, onBackgroundUpdate?: () 
         topItems: r.topItems,
     });
 
+    const saveItems = (r: InventoryResult) =>
+        pushItemsSnap(steamId, { ts: Date.now(), currency: cur, total: r.total, items: r.allItems }).catch(() => { /* */ });
+
     // When the background Steam fallback finishes, persist the fuller total, share it, re-render.
     const onUpdate = onBackgroundUpdate
         ? (final: InventoryResult) => {
             const s = snapFrom(final);
-            pushSnapshot(steamId, s).then(() => { cachePushInventory(steamId, s); onBackgroundUpdate(); }).catch(() => { /* */ });
+            pushSnapshot(steamId, s).then(() => { saveItems(final); cachePushInventory(steamId, s, name); onBackgroundUpdate(); }).catch(() => { /* */ });
         }
         : undefined;
 
@@ -1259,7 +1303,8 @@ async function runInventoryForUser(shownUserId: string, onBackgroundUpdate?: () 
     if (inv.isPrivate) throw new Error("inventory-private");
     const snap = snapFrom(inv);
     await pushSnapshot(steamId, snap);
-    cachePushInventory(steamId, snap); // share to the read-through cache (best-effort)
+    await saveItems(inv);
+    cachePushInventory(steamId, snap, name); // share to the read-through cache (best-effort)
 }
 
 async function refreshCard(card: HTMLElement, shownUserId: string, isOwn: boolean) {
@@ -1644,10 +1689,14 @@ function invEmbed(displayName: string, r: PricedLike, cur: number, steamId?: str
 // as a public markdown message or as an ephemeral embed (clickable links).
 type InvData = { error: string } | { displayName: string; r: PricedLike; cur: number; steamId: string; tradeUrl?: string };
 
-async function buildInventoryData(args: any[]): Promise<InvData> {
+function buildInventoryData(args: any[]): Promise<InvData> {
     const userId = args.find((a: any) => a.name === "user")?.value as string | undefined;
     const steamRef = String(args.find((a: any) => a.name === "steam")?.value ?? "").trim();
+    return priceRef(userId, steamRef);
+}
 
+// Prices one side (a Discord user id OR a Steam ref string). Shared by /inventory and /compare.
+async function priceRef(userId: string | undefined, steamRef: string): Promise<InvData> {
     let steamId: string | null = null;
     let displayName = "CS2 Inventory";
     if (userId) {
@@ -1675,8 +1724,84 @@ async function buildInventoryData(args: any[]): Promise<InvData> {
     const source = validSources.has(stored) ? stored : "csfloat";
     const inv = await loadInventory(steamId, { source, useLiveFallback: false });
     if (inv.isPrivate) return { error: `**${displayName}**'s Steam inventory is private.` };
-    cachePushInventory(steamId, { total: inv.total, priced: inv.priced, itemCount: inv.count, marketableCount: inv.marketableCount, uniqueNames: inv.uniqueNames, ts: Date.now(), source, currency: cur, topItems: inv.topItems });
+    cachePushInventory(steamId, { total: inv.total, priced: inv.priced, itemCount: inv.count, marketableCount: inv.marketableCount, uniqueNames: inv.uniqueNames, ts: Date.now(), source, currency: cur, topItems: inv.topItems }, displayName);
     return { displayName, r: inv, cur, steamId, tradeUrl };
+}
+
+// Deliver a command result: "Post Publicly" ON → send a real message everyone sees (markdown,
+// nonce required or Discord silently drops it); OFF (or no channel) → ephemeral embed. Returning
+// undefined tells BetterDiscord we've already sent it.
+function deliver(ctx: any, markdown: string, embed: any): any {
+    if (settings.store.postPublicly && MessageActions?.sendMessage) {
+        const channelId = ctx?.channel?.id ?? SelectedChannelStore?.getChannelId?.();
+        if (channelId) {
+            MessageActions.sendMessage(channelId, { content: markdown, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] }, undefined, { nonce: String(Date.now()) });
+            return undefined;
+        }
+    }
+    return { embeds: [embed] };
+}
+
+// ─── /leaderboard ───────────────────────────────────────────────────────────
+type LbRow = { steamId: string; total: number; name?: string };
+
+async function buildLeaderboard(limit: number): Promise<{ error: string } | { rows: LbRow[]; cur: number }> {
+    const cur = settings.store.marketCurrency || 1;
+    const rows = await cacheGetLeaderboard(limit, cur);
+    if (!rows.length) return { error: "No inventories tracked yet — run `/inventory` on someone to seed the leaderboard." };
+    // Fill any missing display names (old entries) from their Steam persona, in parallel.
+    await Promise.all(rows.map(async r => {
+        if (!r.name) {
+            const resolved = await resolveSteamRef(r.steamId).catch(() => null);
+            r.name = resolved?.persona || `SteamID …${r.steamId.slice(-5)}`;
+        }
+    }));
+    return { rows, cur };
+}
+
+function lbBody(rows: LbRow[], cur: number): string {
+    const totals = rows.map(r => fmt(r.total, cur));
+    const tw = totals.reduce((a, s) => Math.max(a, s.length), 0);
+    const rw = String(rows.length).length;
+    return rows.map((r, i) => `${String(i + 1).padStart(rw)}. ${totals[i].padStart(tw)}  ${r.name}`).join("\n");
+}
+function leaderboardMarkdown(rows: LbRow[], cur: number): string {
+    return `## CS2 Inventory Leaderboard\n-# richest tracked inventories\n\`\`\`\n${lbBody(rows, cur)}\n\`\`\``;
+}
+function leaderboardEmbed(rows: LbRow[], cur: number): any {
+    return { color: 0x5865F2, title: "CS2 Inventory Leaderboard", description: `\`\`\`\n${lbBody(rows, cur)}\n\`\`\``, footer: { text: "richest tracked inventories" } };
+}
+
+// ─── /compare ───────────────────────────────────────────────────────────────
+type Side = { displayName: string; total: number };
+async function buildCompare(args: any[]): Promise<{ error: string } | { a: Side; b: Side; cur: number }> {
+    const aUser = args.find((x: any) => x.name === "a")?.value as string | undefined;
+    const aSteam = String(args.find((x: any) => x.name === "a_steam")?.value ?? "").trim();
+    const bUser = args.find((x: any) => x.name === "b")?.value as string | undefined;
+    const bSteam = String(args.find((x: any) => x.name === "b_steam")?.value ?? "").trim();
+    if ((!aUser && !aSteam) || (!bUser && !bSteam)) return { error: "Give me **two** sides — `a` and `b` (each a Discord user or a Steam ref)." };
+    const [da, db] = await Promise.all([priceRef(aUser, aSteam), priceRef(bUser, bSteam)]);
+    if ("error" in da) return { error: `First: ${da.error}` };
+    if ("error" in db) return { error: `Second: ${db.error}` };
+    return { a: { displayName: da.displayName, total: da.r.total }, b: { displayName: db.displayName, total: db.r.total }, cur: da.cur };
+}
+
+function compareVerdict(a: Side, b: Side, cur: number): string {
+    const diff = Math.abs(a.total - b.total);
+    if (diff < 0.005) return "Dead tie.";
+    const winner = a.total > b.total ? a : b;
+    return `${winner.displayName} wins by ${fmt(diff, cur)}`;
+}
+function compareBody(a: Side, b: Side, cur: number): string {
+    const nw = Math.max(a.displayName.length, b.displayName.length);
+    const line = (s: Side) => `${s.displayName.padEnd(nw)}  ${fmt(s.total, cur)}`;
+    return `${line(a)}\n${line(b)}`;
+}
+function compareMarkdown(a: Side, b: Side, cur: number): string {
+    return `## ${a.displayName} vs ${b.displayName}\n\`\`\`\n${compareBody(a, b, cur)}\n\`\`\`\n-# ${compareVerdict(a, b, cur)}`;
+}
+function compareEmbed(a: Side, b: Side, cur: number): any {
+    return { color: 0x5865F2, title: `${a.displayName} vs ${b.displayName}`, description: `\`\`\`\n${compareBody(a, b, cur)}\n\`\`\``, footer: { text: compareVerdict(a, b, cur) } };
 }
 
 function registerCommands(): void {
@@ -1693,20 +1818,45 @@ function registerCommands(): void {
                 try {
                     const d = await buildInventoryData(cmdArgs ?? []);
                     if ("error" in d) return { content: d.error };
-                    // "Post Publicly" ON → send a real message everyone sees (labeled bare URLs, since
-                    // Discord won't render masked links in user messages). Discord silently drops a
-                    // sendMessage without a nonce, so one is always supplied.
-                    if (settings.store.postPublicly && MessageActions?.sendMessage) {
-                        const channelId = ctx?.channel?.id ?? SelectedChannelStore?.getChannelId?.();
-                        if (channelId) {
-                            const content = invMarkdown(d.displayName, d.r, d.cur, d.steamId, d.tradeUrl);
-                            MessageActions.sendMessage(channelId, { content, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] }, undefined, { nonce: String(Date.now()) });
-                            return;
-                        }
-                    }
-                    // OFF (or no channel) → ephemeral "only you" embed with clean clickable links.
-                    return { embeds: [invEmbed(d.displayName, d.r, d.cur, d.steamId, d.tradeUrl)] };
+                    return deliver(ctx, invMarkdown(d.displayName, d.r, d.cur, d.steamId, d.tradeUrl), invEmbed(d.displayName, d.r, d.cur, d.steamId, d.tradeUrl));
                 } catch (e) { console.error("[VSI] /inventory", e); return { content: "Error pricing that inventory — try again in a moment." }; }
+            },
+        });
+
+        BD.Commands?.register?.(PLUGIN_NAME, {
+            id: "leaderboard",
+            name: "leaderboard",
+            description: "Richest CS2 inventories the addon has priced",
+            options: [
+                { name: "count", description: "How many to show (default 10, max 25)", type: 4, required: false },
+            ],
+            execute: async (cmdArgs: any[], ctx: any) => {
+                try {
+                    const raw = Number(cmdArgs?.find((a: any) => a.name === "count")?.value);
+                    const limit = Math.min(Math.max(Number.isFinite(raw) ? raw : 10, 1), 25);
+                    const d = await buildLeaderboard(limit);
+                    if ("error" in d) return { content: d.error };
+                    return deliver(ctx, leaderboardMarkdown(d.rows, d.cur), leaderboardEmbed(d.rows, d.cur));
+                } catch (e) { console.error("[VSI] /leaderboard", e); return { content: "Couldn't load the leaderboard — try again in a moment." }; }
+            },
+        });
+
+        BD.Commands?.register?.(PLUGIN_NAME, {
+            id: "compare",
+            name: "compare",
+            description: "Compare two CS2 inventories side by side",
+            options: [
+                { name: "a", description: "First Discord user", type: 6, required: false },
+                { name: "b", description: "Second Discord user", type: 6, required: false },
+                { name: "a_steam", description: "OR first Steam ref (URL / vanity / SteamID64)", type: 3, required: false },
+                { name: "b_steam", description: "OR second Steam ref", type: 3, required: false },
+            ],
+            execute: async (cmdArgs: any[], ctx: any) => {
+                try {
+                    const d = await buildCompare(cmdArgs ?? []);
+                    if ("error" in d) return { content: d.error };
+                    return deliver(ctx, compareMarkdown(d.a, d.b, d.cur), compareEmbed(d.a, d.b, d.cur));
+                } catch (e) { console.error("[VSI] /compare", e); return { content: "Couldn't compare those — try again in a moment." }; }
             },
         });
     } catch (e) { console.warn("[VSI] command registration failed (BdApi.Commands unavailable?)", e); }

@@ -448,6 +448,7 @@ async function loadInventory(steamId, opts) {
     uniqueNames: 0,
     isPrivate: isPriv,
     topItems: [],
+    allItems: [],
     unpriced: [],
     skippedNonMarketable: 0
   });
@@ -492,7 +493,8 @@ async function loadInventory(steamId, opts) {
       name,
       marketable: d.marketable === 1 || d.marketable === "1",
       phase: dp?.phase ?? null,
-      paintIndex: dp?.paintIndex ?? null
+      paintIndex: dp?.paintIndex ?? null,
+      icon: d.icon_url ?? ""
     });
   }
   const groups = /* @__PURE__ */ new Map();
@@ -509,7 +511,7 @@ async function loadInventory(steamId, opts) {
     const gk = meta.phase ? `${meta.name}::${meta.phase}` : meta.name;
     const g = groups.get(gk);
     if (g) g.qty++;
-    else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1 });
+    else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon });
   }
   const uniqueNames = [...new Set([...groups.values()].map((g) => g.name))];
   const priceByName = /* @__PURE__ */ new Map();
@@ -545,11 +547,11 @@ async function loadInventory(steamId, opts) {
       if (p == null) continue;
       total += p * g.qty;
       priced += g.qty;
-      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty });
+      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon });
     }
     perItem.sort((a, b) => b.price * b.qty - a.price * a.qty);
     const topItems = perItem.slice(0, 5).map((i) => ({ name: i.qty > 1 ? `${i.name} \xD7${i.qty}` : i.name, price: i.price * i.qty }));
-    return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
+    return { total, priced, count: inv.assets.length, marketableCount, uniqueNames: uniqueNames.length, isPrivate: false, topItems, allItems: perItem, unpriced: unpriced.slice(0, 5), skippedNonMarketable };
   };
   const shouldRunLive = opts.source === "live_steam" || opts.useLiveFallback && misses.length > 0;
   const runFallback = async () => {
@@ -617,6 +619,20 @@ async function pushSnapshot(steamId, snap) {
   list.unshift(snap);
   await DataStore.set(snapKey(steamId), list.slice(0, 20));
 }
+var itemsKey = (steamId) => `vsi.items.${steamId}`;
+async function getItemsSnaps(steamId) {
+  return await DataStore.get(itemsKey(steamId)) ?? [];
+}
+async function pushItemsSnap(steamId, snap) {
+  const list = await getItemsSnaps(steamId);
+  const prev = list[0];
+  if (prev && prev.total === snap.total && snap.ts - prev.ts < 30 * 6e4) {
+    list[0] = snap;
+  } else {
+    list.unshift(snap);
+  }
+  await DataStore.set(itemsKey(steamId), list.slice(0, 3));
+}
 var CACHE_WORKER = "https://vsi-cache.reap-dev.workers.dev";
 var CACHE_FRESH_MS = 25 * 6e4;
 async function fxFor(cur) {
@@ -645,7 +661,7 @@ async function cacheGetInventory(steamId, cur) {
     return null;
   }
 }
-async function cachePushInventory(steamId, snap) {
+async function cachePushInventory(steamId, snap, name) {
   if (!settings.store.useSharedCache) return;
   try {
     const fx = await fxFor(snap.currency || 1);
@@ -658,10 +674,21 @@ async function cachePushInventory(steamId, snap) {
         item_count: snap.itemCount,
         marketable_count: snap.marketableCount ?? 0,
         unique_names: snap.uniqueNames,
-        top_items: (snap.topItems ?? []).map((t) => ({ name: t.name, price_usd: t.price / fx }))
+        top_items: (snap.topItems ?? []).map((t) => ({ name: t.name, price_usd: t.price / fx })),
+        ...name ? { name } : {}
       }
     });
   } catch {
+  }
+}
+async function cacheGetLeaderboard(limit, cur) {
+  try {
+    const data = await fetchJson(`${CACHE_WORKER}/leaderboard?limit=${limit}`);
+    const entries = Array.isArray(data?.entries) ? data.entries : [];
+    const fx = await fxFor(cur);
+    return entries.map((e) => ({ steamId: String(e.steamId), total: (e.total_usd ?? 0) * fx, name: e.name }));
+  } catch {
+    return [];
   }
 }
 async function cachePushTradeUrl() {
@@ -1100,6 +1127,7 @@ async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
   const source = validSources.has(stored) ? stored : "csfloat";
   const useLiveFallback = !!settings.store.useLiveSteamFallback;
   const cur = settings.store.marketCurrency || 1;
+  const name = UserStore?.getUser?.(shownUserId)?.username;
   const snapFrom = (r) => ({
     total: r.total,
     priced: r.priced,
@@ -1111,10 +1139,13 @@ async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
     currency: cur,
     topItems: r.topItems
   });
+  const saveItems = (r) => pushItemsSnap(steamId, { ts: Date.now(), currency: cur, total: r.total, items: r.allItems }).catch(() => {
+  });
   const onUpdate = onBackgroundUpdate ? (final) => {
     const s = snapFrom(final);
     pushSnapshot(steamId, s).then(() => {
-      cachePushInventory(steamId, s);
+      saveItems(final);
+      cachePushInventory(steamId, s, name);
       onBackgroundUpdate();
     }).catch(() => {
     });
@@ -1123,7 +1154,8 @@ async function runInventoryForUser(shownUserId, onBackgroundUpdate) {
   if (inv.isPrivate) throw new Error("inventory-private");
   const snap = snapFrom(inv);
   await pushSnapshot(steamId, snap);
-  cachePushInventory(steamId, snap);
+  await saveItems(inv);
+  cachePushInventory(steamId, snap, name);
 }
 async function refreshCard(card, shownUserId, isOwn) {
   if (card.classList.contains("loading")) return;
@@ -1435,9 +1467,12 @@ ${body}
 ${linkParts.join("  \xB7  ")}`;
   return { color: 5793266, title: `${displayName} \u2014 ${fmt(r.total, cur)}`, description };
 }
-async function buildInventoryData(args) {
+function buildInventoryData(args) {
   const userId = args.find((a) => a.name === "user")?.value;
   const steamRef = String(args.find((a) => a.name === "steam")?.value ?? "").trim();
+  return priceRef(userId, steamRef);
+}
+async function priceRef(userId, steamRef) {
   let steamId = null;
   let displayName = "CS2 Inventory";
   if (userId) {
@@ -1461,8 +1496,83 @@ async function buildInventoryData(args) {
   const source = validSources.has(stored) ? stored : "csfloat";
   const inv = await loadInventory(steamId, { source, useLiveFallback: false });
   if (inv.isPrivate) return { error: `**${displayName}**'s Steam inventory is private.` };
-  cachePushInventory(steamId, { total: inv.total, priced: inv.priced, itemCount: inv.count, marketableCount: inv.marketableCount, uniqueNames: inv.uniqueNames, ts: Date.now(), source, currency: cur, topItems: inv.topItems });
+  cachePushInventory(steamId, { total: inv.total, priced: inv.priced, itemCount: inv.count, marketableCount: inv.marketableCount, uniqueNames: inv.uniqueNames, ts: Date.now(), source, currency: cur, topItems: inv.topItems }, displayName);
   return { displayName, r: inv, cur, steamId, tradeUrl };
+}
+function deliver(ctx, markdown, embed) {
+  if (settings.store.postPublicly && MessageActions?.sendMessage) {
+    const channelId = ctx?.channel?.id ?? SelectedChannelStore?.getChannelId?.();
+    if (channelId) {
+      MessageActions.sendMessage(channelId, { content: markdown, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] }, void 0, { nonce: String(Date.now()) });
+      return void 0;
+    }
+  }
+  return { embeds: [embed] };
+}
+async function buildLeaderboard(limit) {
+  const cur = settings.store.marketCurrency || 1;
+  const rows = await cacheGetLeaderboard(limit, cur);
+  if (!rows.length) return { error: "No inventories tracked yet \u2014 run `/inventory` on someone to seed the leaderboard." };
+  await Promise.all(rows.map(async (r) => {
+    if (!r.name) {
+      const resolved = await resolveSteamRef(r.steamId).catch(() => null);
+      r.name = resolved?.persona || `SteamID \u2026${r.steamId.slice(-5)}`;
+    }
+  }));
+  return { rows, cur };
+}
+function lbBody(rows, cur) {
+  const totals = rows.map((r) => fmt(r.total, cur));
+  const tw = totals.reduce((a, s) => Math.max(a, s.length), 0);
+  const rw = String(rows.length).length;
+  return rows.map((r, i) => `${String(i + 1).padStart(rw)}. ${totals[i].padStart(tw)}  ${r.name}`).join("\n");
+}
+function leaderboardMarkdown(rows, cur) {
+  return `## CS2 Inventory Leaderboard
+-# richest tracked inventories
+\`\`\`
+${lbBody(rows, cur)}
+\`\`\``;
+}
+function leaderboardEmbed(rows, cur) {
+  return { color: 5793266, title: "CS2 Inventory Leaderboard", description: `\`\`\`
+${lbBody(rows, cur)}
+\`\`\``, footer: { text: "richest tracked inventories" } };
+}
+async function buildCompare(args) {
+  const aUser = args.find((x) => x.name === "a")?.value;
+  const aSteam = String(args.find((x) => x.name === "a_steam")?.value ?? "").trim();
+  const bUser = args.find((x) => x.name === "b")?.value;
+  const bSteam = String(args.find((x) => x.name === "b_steam")?.value ?? "").trim();
+  if (!aUser && !aSteam || !bUser && !bSteam) return { error: "Give me **two** sides \u2014 `a` and `b` (each a Discord user or a Steam ref)." };
+  const [da, db] = await Promise.all([priceRef(aUser, aSteam), priceRef(bUser, bSteam)]);
+  if ("error" in da) return { error: `First: ${da.error}` };
+  if ("error" in db) return { error: `Second: ${db.error}` };
+  return { a: { displayName: da.displayName, total: da.r.total }, b: { displayName: db.displayName, total: db.r.total }, cur: da.cur };
+}
+function compareVerdict(a, b, cur) {
+  const diff = Math.abs(a.total - b.total);
+  if (diff < 5e-3) return "Dead tie.";
+  const winner = a.total > b.total ? a : b;
+  return `${winner.displayName} wins by ${fmt(diff, cur)}`;
+}
+function compareBody(a, b, cur) {
+  const nw = Math.max(a.displayName.length, b.displayName.length);
+  const line = (s) => `${s.displayName.padEnd(nw)}  ${fmt(s.total, cur)}`;
+  return `${line(a)}
+${line(b)}`;
+}
+function compareMarkdown(a, b, cur) {
+  return `## ${a.displayName} vs ${b.displayName}
+\`\`\`
+${compareBody(a, b, cur)}
+\`\`\`
+-# ${compareVerdict(a, b, cur)}`;
+}
+function compareEmbed(a, b, cur) {
+  return { color: 5793266, title: `${a.displayName} vs ${b.displayName}`, description: `\`\`\`
+${compareBody(a, b, cur)}
+\`\`\``, footer: { text: compareVerdict(a, b, cur) } };
 }
 function registerCommands() {
   try {
@@ -1478,18 +1588,51 @@ function registerCommands() {
         try {
           const d = await buildInventoryData(cmdArgs ?? []);
           if ("error" in d) return { content: d.error };
-          if (settings.store.postPublicly && MessageActions?.sendMessage) {
-            const channelId = ctx?.channel?.id ?? SelectedChannelStore?.getChannelId?.();
-            if (channelId) {
-              const content = invMarkdown(d.displayName, d.r, d.cur, d.steamId, d.tradeUrl);
-              MessageActions.sendMessage(channelId, { content, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] }, void 0, { nonce: String(Date.now()) });
-              return;
-            }
-          }
-          return { embeds: [invEmbed(d.displayName, d.r, d.cur, d.steamId, d.tradeUrl)] };
+          return deliver(ctx, invMarkdown(d.displayName, d.r, d.cur, d.steamId, d.tradeUrl), invEmbed(d.displayName, d.r, d.cur, d.steamId, d.tradeUrl));
         } catch (e) {
           console.error("[VSI] /inventory", e);
           return { content: "Error pricing that inventory \u2014 try again in a moment." };
+        }
+      }
+    });
+    BD.Commands?.register?.(PLUGIN_NAME, {
+      id: "leaderboard",
+      name: "leaderboard",
+      description: "Richest CS2 inventories the addon has priced",
+      options: [
+        { name: "count", description: "How many to show (default 10, max 25)", type: 4, required: false }
+      ],
+      execute: async (cmdArgs, ctx) => {
+        try {
+          const raw = Number(cmdArgs?.find((a) => a.name === "count")?.value);
+          const limit = Math.min(Math.max(Number.isFinite(raw) ? raw : 10, 1), 25);
+          const d = await buildLeaderboard(limit);
+          if ("error" in d) return { content: d.error };
+          return deliver(ctx, leaderboardMarkdown(d.rows, d.cur), leaderboardEmbed(d.rows, d.cur));
+        } catch (e) {
+          console.error("[VSI] /leaderboard", e);
+          return { content: "Couldn't load the leaderboard \u2014 try again in a moment." };
+        }
+      }
+    });
+    BD.Commands?.register?.(PLUGIN_NAME, {
+      id: "compare",
+      name: "compare",
+      description: "Compare two CS2 inventories side by side",
+      options: [
+        { name: "a", description: "First Discord user", type: 6, required: false },
+        { name: "b", description: "Second Discord user", type: 6, required: false },
+        { name: "a_steam", description: "OR first Steam ref (URL / vanity / SteamID64)", type: 3, required: false },
+        { name: "b_steam", description: "OR second Steam ref", type: 3, required: false }
+      ],
+      execute: async (cmdArgs, ctx) => {
+        try {
+          const d = await buildCompare(cmdArgs ?? []);
+          if ("error" in d) return { content: d.error };
+          return deliver(ctx, compareMarkdown(d.a, d.b, d.cur), compareEmbed(d.a, d.b, d.cur));
+        } catch (e) {
+          console.error("[VSI] /compare", e);
+          return { content: "Couldn't compare those \u2014 try again in a moment." };
         }
       }
     });
