@@ -978,6 +978,8 @@ interface Snapshot {
     stickerTotal?: number; // portion of total from applied stickers (local snapshots only)
     rank?: number;   // global leaderboard position (1 = richest), from the shared cache
     tracked?: number; // how many inventories the cache is tracking
+    series?: number[]; // shared value history (display currency, oldest→newest) — from the cache,
+                       // used to draw a sparkline on a first/foreign view before local history exists
 }
 
 const snapKey = (steamId: string) => `vsi.snap.${steamId}`;
@@ -990,9 +992,16 @@ async function getSnapshots(steamId: string): Promise<Snapshot[]> {
 const getSnapshotsSync = (steamId: string): Snapshot[] => BD.Data.load(PLUGIN_NAME, snapKey(steamId)) ?? [];
 const getItemsSnapsSync = (steamId: string): ItemsSnapshot[] => BD.Data.load(PLUGIN_NAME, itemsKey(steamId)) ?? [];
 
+const SNAP_COALESCE_MS = 20 * 60_000; // re-prices within this window replace the newest point
 async function pushSnapshot(steamId: string, snap: Snapshot) {
     const list = await getSnapshots(steamId);
-    list.unshift(snap);
+    // Coalesce: a manual refresh fires the fast CSFloat price AND the fuller Steam-fallback price,
+    // and users hit ↻ repeatedly — each would otherwise add a sparkline point and turn the line
+    // into a sawtooth. Replace the newest point when it's within the window (same currency) so the
+    // sparkline stays a real time-series, not a refresh counter.
+    const prev = list[0];
+    if (prev && (snap.ts - prev.ts) < SNAP_COALESCE_MS && (prev.currency || 1) === (snap.currency || 1)) list[0] = snap;
+    else list.unshift(snap);
     // Keep ~10 days at the 6h background cadence, so even a 7-day delta window has a data point.
     await DataStore.set(snapKey(steamId), list.slice(0, 40));
 }
@@ -1113,6 +1122,7 @@ async function cacheGetInventory(steamId: string, cur: number): Promise<Snapshot
             topItems: (data.top_items ?? []).map((t: any) => ({ name: t.name, price: (t.price_usd ?? 0) * fx, color: t.color })),
             rank: typeof data.rank === "number" ? data.rank : undefined,
             tracked: typeof data.tracked === "number" ? data.tracked : undefined,
+            series: Array.isArray(data.series) ? data.series.filter((v: any) => typeof v === "number").map((v: number) => v * fx) : undefined,
         };
     } catch { return null; }
 }
@@ -2196,7 +2206,13 @@ function renderPricedCard(card: HTMLElement, latest: Snapshot, history: Snapshot
     let sparkHtml = "";
     if (settings.store.showSparkline !== false) {
         // Chronological value series (oldest → newest) in the current currency only.
-        const series = [...history].reverse().concat(latest).filter(s => (s.currency || 1) === cur).map(s => s.total);
+        const local = [...history].reverse().concat(latest).filter(s => (s.currency || 1) === cur).map(s => s.total);
+        // Local history is thin on a first/foreign view — fall back to the shared value history from
+        // the cache so any profile shows a real trend line immediately (ending at the current total).
+        let series = local;
+        if (local.length < 2 && latest.series && latest.series.length >= 2) {
+            series = latest.series[latest.series.length - 1] === latest.total ? latest.series : [...latest.series, latest.total];
+        }
         sparkHtml = sparklineSvg(series, cur);
     }
 

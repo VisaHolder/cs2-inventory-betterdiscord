@@ -2,7 +2,7 @@
  * @name CS2Inventory
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.6.0
+ * @version 1.6.1
  * @source https://github.com/VisaHolder/cs2-inventory-betterdiscord
  * @website https://github.com/VisaHolder/cs2-inventory-betterdiscord
  */
@@ -1184,9 +1184,12 @@ async function getSnapshots(steamId) {
 }
 var getSnapshotsSync = (steamId) => BD.Data.load(PLUGIN_NAME, snapKey(steamId)) ?? [];
 var getItemsSnapsSync = (steamId) => BD.Data.load(PLUGIN_NAME, itemsKey(steamId)) ?? [];
+var SNAP_COALESCE_MS = 20 * 6e4;
 async function pushSnapshot(steamId, snap) {
   const list = await getSnapshots(steamId);
-  list.unshift(snap);
+  const prev = list[0];
+  if (prev && snap.ts - prev.ts < SNAP_COALESCE_MS && (prev.currency || 1) === (snap.currency || 1)) list[0] = snap;
+  else list.unshift(snap);
   await DataStore.set(snapKey(steamId), list.slice(0, 40));
 }
 var itemsKey = (steamId) => `vsi.items.${steamId}`;
@@ -1280,7 +1283,8 @@ async function cacheGetInventory(steamId, cur) {
       currency: cur,
       topItems: (data.top_items ?? []).map((t) => ({ name: t.name, price: (t.price_usd ?? 0) * fx, color: t.color })),
       rank: typeof data.rank === "number" ? data.rank : void 0,
-      tracked: typeof data.tracked === "number" ? data.tracked : void 0
+      tracked: typeof data.tracked === "number" ? data.tracked : void 0,
+      series: Array.isArray(data.series) ? data.series.filter((v) => typeof v === "number").map((v) => v * fx) : void 0
     };
   } catch {
     return null;
@@ -2284,7 +2288,11 @@ function renderPricedCard(card, latest, history, changed) {
   const diffHtml = changed ? `<div class="vsi-diff">${escapeHtml(changed)}</div>` : "";
   let sparkHtml = "";
   if (settings.store.showSparkline !== false) {
-    const series = [...history].reverse().concat(latest).filter((s) => (s.currency || 1) === cur).map((s) => s.total);
+    const local = [...history].reverse().concat(latest).filter((s) => (s.currency || 1) === cur).map((s) => s.total);
+    let series = local;
+    if (local.length < 2 && latest.series && latest.series.length >= 2) {
+      series = latest.series[latest.series.length - 1] === latest.total ? latest.series : [...latest.series, latest.total];
+    }
     sparkHtml = sparklineSvg(series, cur);
   }
   card.innerHTML = `
