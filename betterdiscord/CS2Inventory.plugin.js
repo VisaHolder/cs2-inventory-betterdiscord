@@ -2,7 +2,7 @@
  * @name CS2Inventory
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.6.5
+ * @version 1.6.6
  * @source https://github.com/VisaHolder/cs2-inventory-betterdiscord
  * @website https://github.com/VisaHolder/cs2-inventory-betterdiscord
  */
@@ -840,6 +840,29 @@ function parseStickers(desc) {
   }
   return out;
 }
+function parseTradeHold(desc) {
+  const tradable = desc?.tradable === 1 || desc?.tradable === "1" || desc?.tradable === true;
+  let tradableAfter;
+  if (!tradable) for (const e of desc?.owner_descriptions ?? []) {
+    const v = e?.value;
+    if (typeof v !== "string") continue;
+    const m = v.match(/Tradable(?:\/Marketable)?\s+After\s+(.+)/i);
+    if (m) {
+      const t = Date.parse(m[1].replace(/\(.*?\)/g, "").trim());
+      if (!isNaN(t)) {
+        tradableAfter = t;
+        break;
+      }
+    }
+  }
+  return { tradable, tradableAfter };
+}
+function untilLabel(ts) {
+  const ms = ts - Date.now();
+  if (ms <= 0) return "";
+  const days = Math.ceil(ms / 864e5);
+  return days >= 1 ? `${days}d` : `${Math.ceil(ms / 36e5)}h`;
+}
 var dopplerIconMap = null;
 var skinMetaByName = /* @__PURE__ */ new Map();
 var dopplerMapPromise = null;
@@ -1040,10 +1063,13 @@ async function loadInventory(steamId, opts) {
     const name = d.market_hash_name;
     const dp = isDopplerName(name) && d.icon_url ? dopMap.get(d.icon_url) ?? null : null;
     const typeTag = (d.tags ?? []).find((t) => t.category === "Type")?.internal_name ?? "";
+    const hold = parseTradeHold(d);
     metaByKey.set(`${d.classid}_${d.instanceid}`, {
       name,
       marketable: d.marketable === 1 || d.marketable === "1" || d.marketable === true,
       // public: 0/1, authed: boolean
+      tradable: hold.tradable,
+      tradableAfter: hold.tradableAfter,
       phase: dp?.phase ?? null,
       paintIndex: dp?.paintIndex ?? null,
       icon: d.icon_url ?? "",
@@ -1073,7 +1099,7 @@ async function loadInventory(steamId, opts) {
     if (g) {
       g.qty++;
       g.assetids.push(a.assetid);
-    } else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon, stickers: meta.stickers, rarity: meta.rarity, assetids: [a.assetid], catType: meta.catType });
+    } else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon, stickers: meta.stickers, rarity: meta.rarity, assetids: [a.assetid], catType: meta.catType, tradable: meta.tradable, tradableAfter: meta.tradableAfter });
   }
   const uniqueNames = [...new Set([...groups.values()].map((g) => g.name))];
   const priceByName = /* @__PURE__ */ new Map();
@@ -1123,7 +1149,7 @@ async function loadInventory(steamId, opts) {
       if (sm) stickerTotal += sm.value * g.qty;
       const ap = g.qty === 1 ? floatMap.get(g.assetids[0]) : void 0;
       const floatFlag = ap?.float != null ? floatFlagFor(g.name, ap.float, g.paintIndex, thresholds) ?? void 0 : void 0;
-      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || void 0, hashName: g.name, float: ap?.float, seed: ap?.seed, nametag: ap?.nametag, catType: g.catType, inspect: ap?.inspect, assetid: g.qty === 1 ? g.assetids[0] : void 0, floatFlag });
+      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, stickers: g.stickers.length ? g.stickers : void 0, rarity: g.rarity || void 0, hashName: g.name, float: ap?.float, seed: ap?.seed, nametag: ap?.nametag, catType: g.catType, inspect: ap?.inspect, assetid: g.qty === 1 ? g.assetids[0] : void 0, floatFlag, tradable: g.tradable, tradableAfter: g.tradableAfter });
     }
     perItem.sort((a, b) => b.price * b.qty - a.price * a.qty);
     const topItems = perItem.slice(0, 10).map((i) => ({ name: i.qty > 1 ? `${i.name} \xD7${i.qty}` : i.name, price: i.price * i.qty, color: i.rarity }));
@@ -1835,6 +1861,9 @@ var BUTTON_CSS = `
 }
 .vsi-modal-chip:hover { color: #fff; border-color: rgba(255,255,255,.18); }
 .vsi-modal-chip.active { background: #5865F2; color: #fff; border-color: transparent; }
+.vsi-modal-chip-break { flex-basis: 100%; height: 0; }
+.vsi-modal-rchip { font-size: 10px; padding: 3px 8px; }
+.vsi-modal-rchip.active { background: rgba(255,255,255,.10); color: #fff; }
 .vsi-modal-thumb {
     width: 44px; height: 34px; flex: none; object-fit: contain;
     background: rgba(255,255,255,.03); border-radius: 5px;
@@ -1846,6 +1875,8 @@ var BUTTON_CSS = `
     color: #57c2a0; background: rgba(87,194,160,.12); white-space: nowrap;
 }
 .vsi-modal-sticker.grail { color: #e6b800; background: rgba(230,184,0,.14); }
+/* Trade-hold / not-tradable pill */
+.vsi-modal-hold { font-size: 9px; font-weight: 800; letter-spacing: .03em; flex: none; white-space: nowrap; padding: 2px 5px; border-radius: 4px; color: #f6a5a5; background: rgba(220,70,70,.16); }
 .vsi-modal-price { font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; color: #f2f3f5; flex: none; }
 .vsi-modal-empty { padding: 28px 16px; text-align: center; color: #949ba4; font-size: 13px; }
 
@@ -2217,6 +2248,15 @@ async function checkForUpdate() {
     console.error("[VSI] update prompt", e);
   }
 }
+var RARITY_TIERS = {
+  b0c3d9: { name: "Consumer", ord: 0 },
+  "5e98d9": { name: "Industrial", ord: 1 },
+  "4b69ff": { name: "Mil-Spec", ord: 2 },
+  "8847ff": { name: "Restricted", ord: 3 },
+  d32ce6: { name: "Classified", ord: 4 },
+  eb4b4b: { name: "Covert", ord: 5 },
+  e4ae39: { name: "Contraband", ord: 6 }
+};
 var TOKEN_URL = "https://steamcommunity.com/pointssummary/ajaxgetasyncconfig";
 function maybePromptToken() {
   try {
@@ -2755,26 +2795,31 @@ async function openInventoryModal(steamId, displayName) {
   let currentRows = [];
   let query = "";
   let typeFilter = null;
+  let rarityFilter = null;
   const TYPE_ORDER = ["Knives", "Gloves", "Rifles", "Snipers", "Pistols", "SMGs", "Heavy", "Agents", "Stickers", "Charms", "Graffiti", "Music Kits", "Cases", "Pins", "Other"];
   let filtersSig = "";
   const renderFilters = () => {
     const present = TYPE_ORDER.filter((c) => items.some((i) => i.catType === c));
-    const sig = present.join("|") + "::" + (typeFilter ?? "");
+    const rarities = [...new Set(items.map((i) => i.rarity).filter(Boolean))].sort((a, b) => (RARITY_TIERS[a]?.ord ?? 99) - (RARITY_TIERS[b]?.ord ?? 99));
+    const sig = present.join("|") + "::" + (typeFilter ?? "") + "::" + rarities.join("|") + "::" + (rarityFilter ?? "");
     if (sig === filtersSig) return;
     filtersSig = sig;
-    if (present.length <= 1) {
-      filtersEl.innerHTML = "";
-      return;
-    }
-    filtersEl.innerHTML = ["All", ...present].map((c) => {
+    const typeChips = present.length <= 1 ? "" : ["All", ...present].map((c) => {
       const active = c === "All" && !typeFilter || c === typeFilter;
       return `<button class="vsi-modal-chip${active ? " active" : ""}" data-cat="${c === "All" ? "" : escapeHtml(c)}">${c}</button>`;
     }).join("");
+    const rarityChips = rarities.length <= 1 ? "" : `<div class="vsi-modal-chip-break"></div>` + [["", "All"]].concat(rarities.map((h) => [h, RARITY_TIERS[h]?.name ?? "\u2605"])).map(([hex, label]) => {
+      const active = !hex && !rarityFilter || hex === rarityFilter;
+      const tint = hex ? ` style="color:#${hex}"` : "";
+      return `<button class="vsi-modal-chip vsi-modal-rchip${active ? " active" : ""}" data-rarity="${hex}"${tint}>${label}</button>`;
+    }).join("");
+    filtersEl.innerHTML = typeChips + rarityChips;
   };
   filtersEl.addEventListener("click", (e) => {
     const chip = e.target?.closest(".vsi-modal-chip");
     if (!chip) return;
-    typeFilter = chip.dataset.cat || null;
+    if (chip.dataset.rarity != null) rarityFilter = chip.dataset.rarity || null;
+    else typeFilter = chip.dataset.cat || null;
     filtersSig = "";
     renderFilters();
     render();
@@ -2790,8 +2835,18 @@ async function openInventoryModal(steamId, displayName) {
       listEl.innerHTML = `<div class="vsi-modal-empty">Couldn't load this inventory \u2014 it may be private.</div>`;
       return;
     }
-    const filtered = items.filter((i) => (!query || abbrevItem(i.name).toLowerCase().includes(query)) && (!typeFilter || i.catType === typeFilter));
-    filtered.sort((a, b) => sortMode === "value" ? b.price * b.qty - a.price * a.qty : abbrevItem(a.name).localeCompare(abbrevItem(b.name)));
+    const filtered = items.filter((i) => (!query || abbrevItem(i.name).toLowerCase().includes(query)) && (!typeFilter || i.catType === typeFilter) && (!rarityFilter || i.rarity === rarityFilter));
+    const byValue = (a, b) => b.price * b.qty - a.price * a.qty;
+    filtered.sort((a, b) => {
+      if (sortMode === "name") return abbrevItem(a.name).localeCompare(abbrevItem(b.name));
+      if (sortMode === "float") {
+        if (a.float == null && b.float == null) return byValue(a, b);
+        if (a.float == null) return 1;
+        if (b.float == null) return -1;
+        return a.float - b.float;
+      }
+      return byValue(a, b);
+    });
     if (!filtered.length) {
       listEl.innerHTML = '<div class="vsi-modal-empty">No items match your search.</div>';
       return;
@@ -2799,8 +2854,11 @@ async function openInventoryModal(steamId, displayName) {
     currentRows = filtered;
     const rows = filtered.map((i, idx) => {
       const sv = (i.stickerValue ?? 0) * i.qty;
-      const badge = i.stickerCount ? `<span class="vsi-modal-sticker${sv >= 50 ? " grail" : ""}" title="${i.stickerCount} sticker${i.stickerCount > 1 ? "s" : ""}">+${fmt(sv, cur)}</span>` : "";
+      const stickerNames = (i.stickers ?? []).map((s) => s.replace(/^Sticker \| /, "")).join(", ");
+      const badge = i.stickerCount ? `<span class="vsi-modal-sticker${sv >= 50 ? " grail" : ""}" title="${escapeHtml(stickerNames || `${i.stickerCount} sticker${i.stickerCount > 1 ? "s" : ""}`)}">+${fmt(sv, cur)}</span>` : "";
+      const hold = i.tradable === false ? `<span class="vsi-modal-hold" title="${i.tradableAfter ? `Trade hold \u2014 tradable ${new Date(i.tradableAfter).toLocaleDateString()}` : "On trade hold / not tradable"}">${i.tradableAfter && untilLabel(i.tradableAfter) ? `hold ${untilLabel(i.tradableAfter)}` : "locked"}</span>` : "";
       const pills = [
+        hold,
         stTag(i.name),
         fadeBadge(i.name, i.seed),
         i.floatFlag ? `<span class="vsi-modal-frank ${i.floatFlag}" title="${i.floatFlag === "low" ? "Ranked low float for this skin (FloatDB)" : "Ranked high float for this skin (FloatDB)"}">${i.floatFlag === "low" ? "\u{1F947} low" : "high"}</span>` : "",
@@ -2855,8 +2913,8 @@ async function openInventoryModal(steamId, displayName) {
     render();
   });
   sortEl.addEventListener("click", () => {
-    sortMode = sortMode === "value" ? "name" : "value";
-    sortEl.textContent = sortMode === "value" ? "Sort: Value" : "Sort: Name";
+    sortMode = sortMode === "value" ? "float" : sortMode === "float" ? "name" : "value";
+    sortEl.textContent = sortMode === "value" ? "Sort: Value" : sortMode === "float" ? "Sort: Float" : "Sort: Name";
     render();
   });
   render();
