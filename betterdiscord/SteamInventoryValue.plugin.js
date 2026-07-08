@@ -896,11 +896,25 @@ function humanAgo(ms) {
   const d = Math.round(h / 24);
   return `${d}d ago`;
 }
+function windowLabel(minutes) {
+  if (minutes < 60) return `${minutes}m`;
+  const h = minutes / 60;
+  if (h < 24) return `${h}h`;
+  return h % 24 === 0 && h / 24 >= 7 ? `${h / 24}d` : `${h}h`;
+}
 function computeDelta(currentTotal, snaps, minAgeMs) {
   const now = Date.now();
   const differing = snaps.filter((s) => s.total !== currentTotal);
   if (!differing.length) return null;
-  const prev = differing.find((s) => now - s.ts >= minAgeMs) ?? differing[differing.length - 1];
+  const target = now - minAgeMs;
+  let prev = differing[0], best = Infinity;
+  for (const s of differing) {
+    const gap = Math.abs(s.ts - target);
+    if (gap < best) {
+      best = gap;
+      prev = s;
+    }
+  }
   return { delta: currentTotal - prev.total, ago: humanAgo(now - prev.ts) };
 }
 var STEAM_ICON_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M11.98 2C6.7 2 2.36 6.03 2 11.13l5.38 2.22a2.86 2.86 0 0 1 1.6-.48h.15l2.4-3.47v-.05a3.83 3.83 0 1 1 3.83 3.83h-.09l-3.42 2.44v.13a2.87 2.87 0 0 1-5.42 1.3L2.5 15.5A9.99 9.99 0 0 0 22 12c0-5.52-4.48-10-10.02-10ZM8.79 17.16l-1.22-.5a2.16 2.16 0 0 0 1.15 1.13c1.09.45 2.35-.06 2.8-1.16.22-.53.22-1.11 0-1.64a2.15 2.15 0 0 0-1.14-1.16 2.14 2.14 0 0 0-1.64.01l1.26.52a1.59 1.59 0 1 1-1.21 2.94v-.14Zm10.02-7.6a2.55 2.55 0 0 1-5.11 0 2.55 2.55 0 0 1 5.11 0Zm-4.47 0a1.92 1.92 0 1 0 3.83 0 1.92 1.92 0 0 0-3.83 0Z"/></svg>';
@@ -1583,13 +1597,13 @@ function renderPricedCard(card, latest, history, changed) {
   card.classList.toggle("stale", isStale);
   let deltaHtml = "";
   if (settings.store.showPriceChange) {
-    const minAge = (settings.store.deltaMinAgeMinutes || 60) * 6e4;
-    const d = computeDelta(latest.total, history, minAge);
+    const minAgeMin = settings.store.deltaMinAgeMinutes || 1440;
+    const d = computeDelta(latest.total, history, minAgeMin * 6e4);
     if (d) {
       const cls = d.delta > 0 ? "up" : d.delta < 0 ? "down" : "";
       const sign = d.delta >= 0 ? "+" : "";
-      const period = d.ago.replace(/\s*ago$/, "");
-      deltaHtml = `<span class="vsi-delta ${cls}" title="change since your snapshot ${d.ago}">${sign}${fmt(d.delta, cur)} \xB7 ${period}</span>`;
+      const win = windowLabel(minAgeMin);
+      deltaHtml = `<span class="vsi-delta ${cls}" title="change over the last ${win} (nearest snapshot ${d.ago})">${sign}${fmt(d.delta, cur)} \xB7 ${win}</span>`;
     }
   }
   const shortSource = latest.source === "csfloat" ? "CSFloat" : latest.source === "skinport" ? "Skinport" : latest.source === "live_steam" ? "Steam Live" : latest.source;

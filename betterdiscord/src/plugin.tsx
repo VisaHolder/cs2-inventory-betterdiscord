@@ -1029,16 +1029,26 @@ function humanAgo(ms: number): string {
     return `${d}d ago`;
 }
 
+// A fixed window label for the delta chip — the same on every card (e.g. "24h", "7d"), so the
+// timeframe is consistent across all profiles regardless of when each was last priced.
+function windowLabel(minutes: number): string {
+    if (minutes < 60) return `${minutes}m`;
+    const h = minutes / 60;
+    if (h < 24) return `${h}h`;
+    return (h % 24 === 0 && h / 24 >= 7) ? `${h / 24}d` : `${h}h`;
+}
+
 function computeDelta(currentTotal: number, snaps: Snapshot[], minAgeMs: number): { delta: number; ago: string } | null {
     const now = Date.now();
-    // `snaps` is newest→oldest and excludes the current run. Compare against a past snapshot with a
-    // different total. Prefer the most recent one at least `minAge` old (the chosen window); but if
-    // no snapshot is that old yet — history depth varies per profile since there's no background
-    // pricing — fall back to the OLDEST one we have, so the chip always reflects a real change
-    // instead of blinking out. The label always shows that snapshot's true age.
+    // `snaps` excludes the current run. Compare against the snapshot CLOSEST to `window` ago, so the
+    // chip always reflects the change over that fixed window (labeled the same on every card). With
+    // no background pricing the nearest snapshot may not be exactly `window` old — its true age is
+    // surfaced in the tooltip — but the visible timeframe stays consistent across profiles.
     const differing = snaps.filter(s => s.total !== currentTotal);
     if (!differing.length) return null;
-    const prev = differing.find(s => now - s.ts >= minAgeMs) ?? differing[differing.length - 1];
+    const target = now - minAgeMs;
+    let prev = differing[0], best = Infinity;
+    for (const s of differing) { const gap = Math.abs(s.ts - target); if (gap < best) { best = gap; prev = s; } }
     return { delta: currentTotal - prev.total, ago: humanAgo(now - prev.ts) };
 }
 
@@ -1790,15 +1800,15 @@ function renderPricedCard(card: HTMLElement, latest: Snapshot, history: Snapshot
 
     let deltaHtml = "";
     if (settings.store.showPriceChange) {
-        const minAge = (settings.store.deltaMinAgeMinutes || 60) * 60_000;
-        const d = computeDelta(latest.total, history, minAge);
+        const minAgeMin = settings.store.deltaMinAgeMinutes || 1440;
+        const d = computeDelta(latest.total, history, minAgeMin * 60_000);
         if (d) {
             const cls = d.delta > 0 ? "up" : d.delta < 0 ? "down" : "";
             const sign = d.delta >= 0 ? "+" : "";
-            // Show the period the change is measured over (e.g. "+C$0.88 · 2h"), so it's clear
-            // it's the move since the last snapshot that old — not an arbitrary number.
-            const period = d.ago.replace(/\s*ago$/, "");
-            deltaHtml = `<span class="vsi-delta ${cls}" title="change since your snapshot ${d.ago}">${sign}${fmt(d.delta, cur)} · ${period}</span>`;
+            // Fixed window label (same on every card) so the timeframe is consistent across profiles;
+            // the nearest snapshot's true age is in the tooltip for anyone who wants the exact basis.
+            const win = windowLabel(minAgeMin);
+            deltaHtml = `<span class="vsi-delta ${cls}" title="change over the last ${win} (nearest snapshot ${d.ago})">${sign}${fmt(d.delta, cur)} · ${win}</span>`;
         }
     }
 
