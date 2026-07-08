@@ -7,6 +7,9 @@
  * pricing (CSFloat), FX-converted prices, and a Trade Offer / Steam button row.
  */
 
+import { FadeCalculator, AmberFadeCalculator, AcidFadeCalculator } from "csgo-fade-percentage-calculator";
+import bluegemData from "./bluegem.json";
+
 const BD: any = (window as any).BdApi;
 const PLUGIN_NAME = "SteamInventoryValue";
 const { Webpack } = BD;
@@ -1530,6 +1533,9 @@ const BUTTON_CSS = `
     padding: 2px 6px; border-radius: 4px; font-variant-numeric: tabular-nums;
 }
 .vsi-modal-float .vsi-modal-seed { color: #9aa4b2; font-weight: 600; margin-left: 3px; }
+/* Fade % and Blue Gem % chips (derived from the paint seed) */
+.vsi-modal-fade { font-size: 10px; font-weight: 800; flex: none; white-space: nowrap; padding: 2px 6px; border-radius: 4px; color: #ffb060; background: rgba(255,140,50,.15); }
+.vsi-modal-blue { font-size: 10px; font-weight: 800; flex: none; white-space: nowrap; padding: 2px 6px; border-radius: 4px; color: #6fb0ff; background: rgba(90,160,255,.17); }
 /* Custom name tag */
 .vsi-modal-nametag { font-style: italic; color: #c8a2ff; font-weight: 500; }
 /* Type-filter chips */
@@ -2218,6 +2224,39 @@ const wearTag = (name: string): string => {
     return `<span class="vsi-modal-wear ${cls}">${abbr}</span>`;
 };
 
+// ── Rare-pattern intel from the paint seed ──────────────────────────────────────
+// Fade % is deterministic (Step7750's calculator, bundled); Blue Gem % is a lookup in a bundled
+// compact dataset (playside/top blue coverage). The finish + weapon come from the market name.
+const baseWeapon = (name: string): string =>
+    name.replace(/^★\s*/, "").replace(/^StatTrak™\s*/, "").replace(/^Souvenir\s*/, "").split("|")[0].trim();
+const finishOf = (name: string): string => (name.match(/\|\s*([^(]+?)\s*(?:\(|$)/)?.[1] ?? "").trim();
+function fadePercent(name: string, seed?: number): number | null {
+    if (seed == null) return null;
+    const f = finishOf(name);
+    const calc = f === "Fade" ? FadeCalculator : f === "Amber Fade" ? AmberFadeCalculator : f === "Acid Fade" ? AcidFadeCalculator : null;
+    if (!calc) return null;
+    try { return calc.getFadePercentage(baseWeapon(name), seed).percentage; } catch { return null; } // weapon not in that fade set
+}
+function blueGemPercent(name: string, seed?: number): number | null {
+    if (seed == null) return null;
+    return (bluegemData as any)[finishOf(name)]?.[baseWeapon(name)]?.[seed] ?? null;
+}
+// Memoized per name|seed so a big inventory doesn't recompute fade/blue on every keystroke re-render.
+const patMemo = new Map<string, { fade: number | null; blue: number | null }>();
+function patternBadges(name: string, seed?: number): { fade: number | null; blue: number | null } {
+    const key = `${name}|${seed}`;
+    let v = patMemo.get(key);
+    if (!v) { v = { fade: fadePercent(name, seed), blue: blueGemPercent(name, seed) }; patMemo.set(key, v); }
+    return v;
+}
+const fadeBadge = (name: string, seed?: number): string => {
+    const { fade, blue } = patternBadges(name, seed);
+    let h = "";
+    if (fade != null) h += `<span class="vsi-modal-fade" title="Fade percentage">🔥 ${Math.round(fade)}%</span>`;
+    if (blue != null) h += `<span class="vsi-modal-blue" title="Blue Gem — playside blue coverage">💎 ${blue}%</span>`;
+    return h;
+};
+
 let modalKeyHandler: ((e: KeyboardEvent) => void) | null = null;
 function closeInventoryModal() {
     document.querySelector(".vsi-modal-backdrop")?.remove();
@@ -2311,6 +2350,7 @@ async function openInventoryModal(steamId: string, displayName: string) {
                 ${wearTag(i.name)}
                 ${stTag(i.name)}
                 ${i.float != null ? `<span class="vsi-modal-float" title="float / wear value${i.seed != null ? ` · paint seed ${i.seed}` : ""}">${i.float.toFixed(4)}${i.seed != null ? ` <span class="vsi-modal-seed">#${i.seed}</span>` : ""}</span>` : ""}
+                ${fadeBadge(i.name, i.seed)}
                 ${badge}
                 ${i.qty > 1 ? `<span class="vsi-modal-qty">×${i.qty}</span>` : ""}
                 <span class="vsi-modal-price">${fmt(i.price * i.qty, cur)}</span>
@@ -2617,11 +2657,11 @@ function lbBody(rows: LbRow[], cur: number): string {
     return rows.map((r, i) => `${String(i + 1).padStart(rw)}. ${totals[i].padStart(tw)}  ${r.name}`).join("\n");
 }
 function leaderboardMarkdown(rows: LbRow[], cur: number, scoped = false): string {
-    const sub = scoped ? "richest inventories tracked in this server" : "richest tracked inventories";
+    const sub = scoped ? "this server · by value" : "by value";
     return `## CS2 Inventory Leaderboard${scoped ? " — This Server" : ""}\n-# ${sub}\n\`\`\`\n${lbBody(rows, cur)}\n\`\`\``;
 }
 function leaderboardEmbed(rows: LbRow[], cur: number, scoped = false): any {
-    const sub = scoped ? "richest inventories tracked in this server" : "richest tracked inventories";
+    const sub = scoped ? "this server · by value" : "by value";
     return { color: 0x5865F2, title: `CS2 Inventory Leaderboard${scoped ? " — This Server" : ""}`, description: `\`\`\`\n${lbBody(rows, cur)}\n\`\`\``, footer: { text: sub } };
 }
 
