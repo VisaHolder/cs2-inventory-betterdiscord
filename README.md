@@ -10,12 +10,11 @@ Real floats & paint seeds · Doppler phase pricing · live prices in your curren
 
 <br>
 
-|  Full (with top items)  |  Compact  |
+|  On a profile  |  The full breakdown  |
 |:---:|:---:|
-| <img src="docs/shot-full.png" width="230" alt="Full card" /> | <img src="docs/shot-compact.png" width="230" alt="Compact card" /> |
-| <img src="docs/shot-full-2.png" width="230" alt="Larger inventory, full" /> | <img src="docs/shot-compact-2.png" width="230" alt="Larger inventory, compact" /> |
+| <img src="docs/shot-card.png" width="250" alt="CS2 inventory card on a Discord profile" /> | <img src="docs/shot-breakdown.png" width="300" alt="Full breakdown with real floats, fade %, blue gem, wear tags, name tags and type filters" /> |
 
-<sub>The card on a profile, shown full and compact. The sparkline is green when the value's up, red when it's down.</sub>
+<sub>The card on a profile — value, sparkline, top items, what changed. Click it for the full breakdown: real <b>floats</b> & <b>paint seeds</b>, 🔥 <b>fade %</b> / 💎 <b>blue gem</b>, wear tags, name tags, and per-type filters.</sub>
 
 </div>
 

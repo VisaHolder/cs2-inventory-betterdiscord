@@ -2622,7 +2622,7 @@ function prettyName(id: string): string {
 // "Made by reap" credit block pinned above the settings.
 const DONATE_URL = "https://steamcommunity.com/tradeoffer/new/?partner=1149562692&token=smsukaox";
 const GITHUB_URL = "https://github.com/VisaHolder/steam-inventory-value";
-const DISCORD_HANDLE = "reap";
+const DISCORD_HANDLE = "reap.";
 function buildAboutSection(): HTMLElement {
     const el = document.createElement("div");
     el.className = "vsi-about";
