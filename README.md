@@ -40,7 +40,7 @@ Full guide: [`betterdiscord/README.md`](betterdiscord/README.md)
 - **Real floats + paint seeds** — every skin's exact wear value and pattern index, on *any* public inventory, pulled straight from Steam (no login, no key)
 - **Fade % & Blue Gem %** — computed from the seed: 🔥 fade percentage on Fade / Amber / Acid skins, 💎 blue coverage on Case Hardened & Heat Treated
 - **Low-float / high-float flags** — 🥇 badges on ranked top-tier wears (FloatDB thresholds), on any inventory
-- **Full breakdown** — click any card for a searchable, sortable, type-filterable list of every item: thumbnails, real float + seed, color-graded wear (FN→BS), rarity colors, StatTrak™ / Souvenir tags, custom name tags. Left-click an item for its Steam Market page (or configure it to inspect in-game / find on CSFloat / open the owner's inventory); right-click for a menu with all of those. Right-click a user for the same breakdown
+- **Full breakdown** — click any card for a searchable, sortable, type-filterable list of every item: thumbnails, real float + seed, color-graded wear (FN→BS), rarity colors, StatTrak™ / Souvenir tags, custom name tags. Left-click an item for its Steam Market page (or configure it to inspect in-game / find on CSFloat / Buff163 / open the owner's inventory); right-click for a menu with all of those plus **copy inspect link**. Right-click a user for the same breakdown
 - **Price history at a glance** — a sparkline with all-time-high / low markers, a gain/loss delta chip, and a value-milestone badge ($1K / $5K / $10K …)
 - **What changed** — each card shows items gained/dropped since last time
 - **Trade Offer + Steam Profile buttons**, auto-detected from a linked Steam or a shared/bio trade URL

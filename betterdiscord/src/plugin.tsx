@@ -289,6 +289,7 @@ const SETTINGS_SCHEMA: Record<string, any> = {
             { label: "Open its Steam Market listing", value: "market", default: true },
             { label: "Inspect in-game (opens CS2)", value: "inspect" },
             { label: "Find on CSFloat", value: "csfloat" },
+            { label: "Price on Buff163", value: "buff" },
             { label: "View in the owner's Steam inventory", value: "inventory" },
         ],
     },
@@ -299,6 +300,7 @@ const SETTINGS_SCHEMA: Record<string, any> = {
             { label: "Show a menu (pick per item)", value: "menu", default: true },
             { label: "Inspect in-game (opens CS2)", value: "inspect" },
             { label: "Find on CSFloat", value: "csfloat" },
+            { label: "Price on Buff163", value: "buff" },
             { label: "View in the owner's Steam inventory", value: "inventory" },
             { label: "Open its Steam Market listing", value: "market" },
         ],
@@ -2444,27 +2446,41 @@ const steamMarketUrl = (i: PricedItem) =>
     `https://steamcommunity.com/market/listings/730/${encodeURIComponent(i.hashName ?? stripToHashName(i.name))}`;
 // steam:// deep-link that opens CS2 and inspects the exact item (from asset property 6).
 const inspectUrl = (payload: string) => `steam://run/730//+csgo_econ_action_preview%20${payload}`;
-const csfloatSearchUrl = (i: PricedItem) =>
-    `https://csfloat.com/search?market_hash_name=${encodeURIComponent(i.hashName ?? stripToHashName(i.name))}`;
+const hashNameOf = (i: PricedItem) => i.hashName ?? stripToHashName(i.name);
+const csfloatSearchUrl = (i: PricedItem) => `https://csfloat.com/search?market_hash_name=${encodeURIComponent(hashNameOf(i))}`;
+// Buff163's hash-fragment market search (same format CSFloat's own extension links to).
+const buffSearchUrl = (i: PricedItem) => `https://buff.163.com/market/csgo#tab=selling&page_num=1&search=${encodeURIComponent(hashNameOf(i))}`;
 const inventoryUrl = (assetid: string, ownerSteamId: string) =>
     `https://steamcommunity.com/profiles/${ownerSteamId}/inventory/#730_2_${assetid}`;
+// The shareable inspect link (literal space, not %20) — the form you paste into CSFloat's checker.
+const inspectLink = (payload: string) => `steam://run/730//+csgo_econ_action_preview ${payload}`;
 
-// Every action available for a row, in menu order. Kinds whose data is missing (no inspect
-// payload / no assetid) are omitted, so the menu only ever shows things that actually work.
-interface RowAction { kind: string; label: string; url: string; }
+// Copy text to the clipboard through whatever the Discord host exposes.
+function copyText(text: string): boolean {
+    try { const dn = (window as any).DiscordNative; if (dn?.clipboard?.copy) { dn.clipboard.copy(text); return true; } } catch { /* */ }
+    try { const cb = require("electron")?.clipboard; if (cb?.writeText) { cb.writeText(text); return true; } } catch { /* */ }
+    try { (navigator as any).clipboard?.writeText?.(text); return true; } catch { /* */ }
+    return false;
+}
+
+// Every action available for a row, in menu order. A `url` opens externally; a `copy` writes to the
+// clipboard. Kinds whose data is missing (no inspect payload / no assetid) are omitted.
+interface RowAction { kind: string; label: string; url?: string; copy?: string }
 function rowActions(i: PricedItem, ownerSteamId: string): RowAction[] {
     const out: RowAction[] = [];
     if (i.inspect) out.push({ kind: "inspect", label: "Inspect in-game", url: inspectUrl(i.inspect) });
+    if (i.inspect) out.push({ kind: "copyinspect", label: "Copy inspect link", copy: inspectLink(i.inspect) });
     out.push({ kind: "csfloat", label: "Find on CSFloat", url: csfloatSearchUrl(i) });
+    out.push({ kind: "buff", label: "Price on Buff163", url: buffSearchUrl(i) });
     if (i.assetid && ownerSteamId) out.push({ kind: "inventory", label: "View in owner's inventory", url: inventoryUrl(i.assetid, ownerSteamId) });
     out.push({ kind: "market", label: "Steam Market page", url: steamMarketUrl(i) });
     return out;
 }
 // Resolve a configured action kind to its URL for this item, falling back to Market when the
-// chosen kind's data isn't available.
+// chosen kind's data isn't available. (Only URL-kinds are ever selectable as a direct action.)
 const actionUrlFor = (kind: string, i: PricedItem, ownerSteamId: string): string => {
     const acts = rowActions(i, ownerSteamId);
-    return (acts.find(a => a.kind === kind) ?? acts.find(a => a.kind === "market"))!.url;
+    return (acts.find(a => a.kind === kind && a.url) ?? acts.find(a => a.kind === "market"))!.url!;
 };
 // Where a LEFT-click goes, per the itemClickAction setting.
 function itemHref(i: PricedItem, ownerSteamId: string): string {
@@ -2481,6 +2497,7 @@ const clickActionLabel = (i: PricedItem): string => {
     const a = (settings.store.itemClickAction as string) || "market";
     if (a === "inspect" && i.inspect) return "Inspect in-game";
     if (a === "csfloat") return "Find on CSFloat";
+    if (a === "buff") return "Price on Buff163";
     if (a === "inventory" && i.assetid) return "View in owner's inventory";
     return "Open on the Steam Community Market";
 };
@@ -2502,7 +2519,9 @@ function showItemMenu(x: number, y: number, actions: RowAction[]) {
     closeItemMenu();
     const m = document.createElement("div");
     m.className = "vsi-ctx";
-    m.innerHTML = actions.map(a => `<div class="vsi-ctx-item" data-url="${escapeHtml(a.url)}">${escapeHtml(a.label)}</div>`).join("");
+    m.innerHTML = actions.map(a => a.copy != null
+        ? `<div class="vsi-ctx-item" data-copy="${escapeHtml(a.copy)}">${escapeHtml(a.label)}</div>`
+        : `<div class="vsi-ctx-item" data-url="${escapeHtml(a.url ?? "")}">${escapeHtml(a.label)}</div>`).join("");
     document.body.appendChild(m);
     _ctxMenuEl = m;
     const r = m.getBoundingClientRect();
@@ -2510,7 +2529,10 @@ function showItemMenu(x: number, y: number, actions: RowAction[]) {
     m.style.top = `${Math.max(8, Math.min(y, window.innerHeight - r.height - 8))}px`;
     m.addEventListener("click", ev => {
         const el = (ev.target as HTMLElement).closest?.(".vsi-ctx-item") as HTMLElement | null;
-        if (el?.dataset.url) { openProtocol(el.dataset.url); closeItemMenu(); }
+        if (!el) return;
+        if (el.dataset.copy != null) { if (copyText(el.dataset.copy)) try { BD.UI?.showToast?.("Copied inspect link", { type: "success" }); } catch { /* */ } }
+        else if (el.dataset.url) openProtocol(el.dataset.url);
+        closeItemMenu();
     });
     // Defer so the opening right-click's own event doesn't immediately dismiss it.
     setTimeout(() => {
@@ -2710,7 +2732,8 @@ async function openInventoryModal(steamId: string, displayName: string) {
         const mode = (settings.store.rightClickAction as string) || "menu";
         if (mode === "menu") { showItemMenu(e.clientX, e.clientY, acts); return; }
         const chosen = acts.find(a => a.kind === mode) ?? acts.find(a => a.kind === "market");
-        if (chosen) openProtocol(chosen.url);
+        if (chosen?.url) openProtocol(chosen.url);
+        else if (chosen?.copy && copyText(chosen.copy)) try { BD.UI?.showToast?.("Copied inspect link", { type: "success" }); } catch { /* */ }
     });
     // Left-click when the action is "inspect" → the row href is steam://; Discord won't open that
     // from a normal anchor nav, so intercept and route it through openProtocol (http rows fall through).

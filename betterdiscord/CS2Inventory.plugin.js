@@ -2,7 +2,7 @@
  * @name CS2Inventory
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.6.1
+ * @version 1.6.2
  * @source https://github.com/VisaHolder/cs2-inventory-betterdiscord
  * @website https://github.com/VisaHolder/cs2-inventory-betterdiscord
  */
@@ -579,6 +579,7 @@ var SETTINGS_SCHEMA = {
       { label: "Open its Steam Market listing", value: "market", default: true },
       { label: "Inspect in-game (opens CS2)", value: "inspect" },
       { label: "Find on CSFloat", value: "csfloat" },
+      { label: "Price on Buff163", value: "buff" },
       { label: "View in the owner's Steam inventory", value: "inventory" }
     ]
   },
@@ -589,6 +590,7 @@ var SETTINGS_SCHEMA = {
       { label: "Show a menu (pick per item)", value: "menu", default: true },
       { label: "Inspect in-game (opens CS2)", value: "inspect" },
       { label: "Find on CSFloat", value: "csfloat" },
+      { label: "Price on Buff163", value: "buff" },
       { label: "View in the owner's Steam inventory", value: "inventory" },
       { label: "Open its Steam Market listing", value: "market" }
     ]
@@ -2463,19 +2465,48 @@ var steamThumb = (icon) => `https://community.akamai.steamstatic.com/economy/ima
 var stripToHashName = (name) => name.replace(/\s*×\d+\s*$/, "").replace(/\s*\((?:Phase [1-4]|Ruby|Sapphire|Black Pearl|Emerald)\)\s*$/i, "");
 var steamMarketUrl = (i) => `https://steamcommunity.com/market/listings/730/${encodeURIComponent(i.hashName ?? stripToHashName(i.name))}`;
 var inspectUrl = (payload) => `steam://run/730//+csgo_econ_action_preview%20${payload}`;
-var csfloatSearchUrl = (i) => `https://csfloat.com/search?market_hash_name=${encodeURIComponent(i.hashName ?? stripToHashName(i.name))}`;
+var hashNameOf = (i) => i.hashName ?? stripToHashName(i.name);
+var csfloatSearchUrl = (i) => `https://csfloat.com/search?market_hash_name=${encodeURIComponent(hashNameOf(i))}`;
+var buffSearchUrl = (i) => `https://buff.163.com/market/csgo#tab=selling&page_num=1&search=${encodeURIComponent(hashNameOf(i))}`;
 var inventoryUrl = (assetid, ownerSteamId) => `https://steamcommunity.com/profiles/${ownerSteamId}/inventory/#730_2_${assetid}`;
+var inspectLink = (payload) => `steam://run/730//+csgo_econ_action_preview ${payload}`;
+function copyText(text) {
+  try {
+    const dn = window.DiscordNative;
+    if (dn?.clipboard?.copy) {
+      dn.clipboard.copy(text);
+      return true;
+    }
+  } catch {
+  }
+  try {
+    const cb = require("electron")?.clipboard;
+    if (cb?.writeText) {
+      cb.writeText(text);
+      return true;
+    }
+  } catch {
+  }
+  try {
+    navigator.clipboard?.writeText?.(text);
+    return true;
+  } catch {
+  }
+  return false;
+}
 function rowActions(i, ownerSteamId) {
   const out = [];
   if (i.inspect) out.push({ kind: "inspect", label: "Inspect in-game", url: inspectUrl(i.inspect) });
+  if (i.inspect) out.push({ kind: "copyinspect", label: "Copy inspect link", copy: inspectLink(i.inspect) });
   out.push({ kind: "csfloat", label: "Find on CSFloat", url: csfloatSearchUrl(i) });
+  out.push({ kind: "buff", label: "Price on Buff163", url: buffSearchUrl(i) });
   if (i.assetid && ownerSteamId) out.push({ kind: "inventory", label: "View in owner's inventory", url: inventoryUrl(i.assetid, ownerSteamId) });
   out.push({ kind: "market", label: "Steam Market page", url: steamMarketUrl(i) });
   return out;
 }
 var actionUrlFor = (kind, i, ownerSteamId) => {
   const acts = rowActions(i, ownerSteamId);
-  return (acts.find((a) => a.kind === kind) ?? acts.find((a) => a.kind === "market")).url;
+  return (acts.find((a) => a.kind === kind && a.url) ?? acts.find((a) => a.kind === "market")).url;
 };
 function itemHref(i, ownerSteamId) {
   return actionUrlFor(settings.store.itemClickAction || "market", i, ownerSteamId);
@@ -2511,6 +2542,7 @@ var clickActionLabel = (i) => {
   const a = settings.store.itemClickAction || "market";
   if (a === "inspect" && i.inspect) return "Inspect in-game";
   if (a === "csfloat") return "Find on CSFloat";
+  if (a === "buff") return "Price on Buff163";
   if (a === "inventory" && i.assetid) return "View in owner's inventory";
   return "Open on the Steam Community Market";
 };
@@ -2536,7 +2568,7 @@ function showItemMenu(x, y, actions) {
   closeItemMenu();
   const m = document.createElement("div");
   m.className = "vsi-ctx";
-  m.innerHTML = actions.map((a) => `<div class="vsi-ctx-item" data-url="${escapeHtml(a.url)}">${escapeHtml(a.label)}</div>`).join("");
+  m.innerHTML = actions.map((a) => a.copy != null ? `<div class="vsi-ctx-item" data-copy="${escapeHtml(a.copy)}">${escapeHtml(a.label)}</div>` : `<div class="vsi-ctx-item" data-url="${escapeHtml(a.url ?? "")}">${escapeHtml(a.label)}</div>`).join("");
   document.body.appendChild(m);
   _ctxMenuEl = m;
   const r = m.getBoundingClientRect();
@@ -2544,10 +2576,14 @@ function showItemMenu(x, y, actions) {
   m.style.top = `${Math.max(8, Math.min(y, window.innerHeight - r.height - 8))}px`;
   m.addEventListener("click", (ev) => {
     const el = ev.target.closest?.(".vsi-ctx-item");
-    if (el?.dataset.url) {
-      openProtocol(el.dataset.url);
-      closeItemMenu();
-    }
+    if (!el) return;
+    if (el.dataset.copy != null) {
+      if (copyText(el.dataset.copy)) try {
+        BD.UI?.showToast?.("Copied inspect link", { type: "success" });
+      } catch {
+      }
+    } else if (el.dataset.url) openProtocol(el.dataset.url);
+    closeItemMenu();
   });
   setTimeout(() => {
     if (!_ctxMenuEl) return;
@@ -2741,7 +2777,11 @@ async function openInventoryModal(steamId, displayName) {
       return;
     }
     const chosen = acts.find((a) => a.kind === mode) ?? acts.find((a) => a.kind === "market");
-    if (chosen) openProtocol(chosen.url);
+    if (chosen?.url) openProtocol(chosen.url);
+    else if (chosen?.copy && copyText(chosen.copy)) try {
+      BD.UI?.showToast?.("Copied inspect link", { type: "success" });
+    } catch {
+    }
   });
   listEl.addEventListener("click", (e) => {
     const row = e.target?.closest?.("a.vsi-modal-row");
