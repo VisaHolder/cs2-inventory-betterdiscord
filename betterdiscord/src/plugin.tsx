@@ -227,6 +227,12 @@ const SETTINGS_SCHEMA: Record<string, any> = {
         default: "",
         placeholder: "CSFloat API key",
     },
+    steamWebApiToken: {
+        type: OptionType.STRING,
+        description: "Optional Steam web token — unlocks the real float + paint seed on every skin in YOUR OWN inventory's breakdown. Get it (logged into Steam) from steamcommunity.com/pointssummary/ajaxgetasyncconfig and paste the webapi_token value. It's read-only, works only for your own inventory, and expires about every 24h — re-paste when floats stop showing. Steam gives no way to read other people's floats, so this is own-inventory only.",
+        default: "",
+        placeholder: "webapi_token (eyJ0eXAiOi...)",
+    },
     includeStickerValue: {
         type: OptionType.BOOLEAN,
         description: "Add applied-sticker value on top of each skin. Off by default — applied stickers rarely resell for much unless they're very rare, so counting full sticker value overstates what an inventory is actually worth. Turn on only if you want the theoretical sticker-book number.",
@@ -506,7 +512,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 // One priced line in an inventory. `price` is the per-copy value INCLUDING applied stickers;
 // `stickerValue`/`stickerCount` break out the sticker portion (for the badge). `icon` is the
 // Steam icon_url hash; `qty` is how many identical (same skin + same stickers) copies.
-interface PricedItem { name: string; price: number; qty: number; icon?: string; stickerValue?: number; stickerCount?: number; rarity?: string; hashName?: string }
+interface PricedItem { name: string; price: number; qty: number; icon?: string; stickerValue?: number; stickerCount?: number; rarity?: string; hashName?: string; float?: number; seed?: number }
 
 interface InventoryResult {
     total: number;
@@ -538,6 +544,8 @@ function parseStickers(desc: any): string[] {
 interface PricingOptions {
     source: string;
     useLiveFallback: boolean;
+    // Per-asset float/paint-seed (own inventory only, via the Steam webapi_token). Keyed by assetid.
+    assetProps?: Map<string, { float?: number; seed?: number }>;
     onProgress?: (done: number, total: number) => void;
     // When set, the slow live-Steam fallback runs in the background and calls this with the
     // updated result once it finishes, so loadInventory can return the CSFloat total instantly.
@@ -606,6 +614,54 @@ async function getCsfloatPhasePrice(marketHashName: string, paintIndex: number):
     }
 }
 
+// ── Own-inventory float + paint seed (Steam web API) ────────────────────────────
+// The public inventory JSON hides per-item float behind a `propid` placeholder, but the
+// authenticated IEconService/GetInventoryItemsWithDescriptions endpoint returns it directly in
+// asset_properties (propertyid 2 = float/wear, 1 = paint seed). The webapi_token authenticates the
+// CALLER and only ever returns the token OWNER's inventory — so this yields YOUR floats only.
+function base64UrlDecode(s: string): string {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    return atob(s);
+}
+function tokenSteamId(token: string): string | null {
+    try {
+        const payload = JSON.parse(base64UrlDecode(token.split(".")[1] || ""));
+        return typeof payload?.sub === "string" ? payload.sub : null;
+    } catch { return null; }
+}
+async function fetchOwnAssetProps(steamId: string): Promise<Map<string, { float?: number; seed?: number }> | null> {
+    const token = (settings.store.steamWebApiToken || "").trim();
+    if (!token || tokenSteamId(token) !== steamId) return null; // token only unlocks its own owner's inventory
+    const out = new Map<string, { float?: number; seed?: number }>();
+    const base = "https://api.steampowered.com/IEconService/GetInventoryItemsWithDescriptions/v1/";
+    let start: string | undefined;
+    let pages = 0;
+    try {
+        do {
+            const p = new URLSearchParams({ access_token: token, steamid: steamId, appid: "730", contextid: "2", get_asset_properties: "true", count: "2000" });
+            if (start) p.set("start_assetid", start);
+            const resp = (await fetchJson(`${base}?${p.toString()}`))?.response;
+            if (!resp) break;
+            for (const w of (resp.asset_properties ?? [])) {
+                let fl: number | undefined, sd: number | undefined;
+                for (const pr of (w.asset_properties ?? [])) {
+                    if (pr.float_value != null) { const v = Number(pr.float_value); if (v >= 0 && v <= 1) fl = v; }
+                    else if (Number(pr.propertyid) === 1 && pr.int_value != null) { const v = Number(pr.int_value); if (v >= 0 && v <= 1000) sd = v; }
+                }
+                if (fl != null || sd != null) out.set(String(w.assetid), { float: fl, seed: sd });
+            }
+            start = resp.more_items ? String(resp.last_assetid) : undefined;
+            pages++;
+            if (start) await sleep(400);
+        } while (start && pages < 8);
+    } catch (e) {
+        console.warn("[VSI] float fetch failed — webapi_token may be expired (re-paste it)", e);
+        return out.size ? out : null;
+    }
+    return out;
+}
+
 async function loadInventory(steamId: string, opts: PricingOptions): Promise<InventoryResult> {
     const empty = (isPriv: boolean): InventoryResult => ({
         total: 0, priced: 0, count: 0, marketableCount: 0, uniqueNames: 0, isPrivate: isPriv, topItems: [], allItems: [], owned: {}, stickerTotal: 0, unpriced: [], skippedNonMarketable: 0,
@@ -672,7 +728,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
 
     // Group identical items. Dopplers group by name+phase; stickered copies group by their sticker
     // set too, so a 4×-Katowice AK isn't averaged in with a bare one (each sticker set prices apart).
-    interface Group { name: string; phase: string | null; paintIndex: number | null; qty: number; icon: string; stickers: string[]; rarity: string }
+    interface Group { name: string; phase: string | null; paintIndex: number | null; qty: number; icon: string; stickers: string[]; rarity: string; assetids: string[] }
     const groups = new Map<string, Group>();
     const owned = new Map<string, number>(); // every marketable item by name → qty, pricing-independent (diff)
     let marketableCount = 0;
@@ -686,8 +742,8 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
         const stickerSig = meta.stickers.length ? meta.stickers.slice().sort().join("|") : "";
         const gk = `${meta.name}::${meta.phase ?? ""}::${stickerSig}`;
         const g = groups.get(gk);
-        if (g) g.qty++;
-        else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon, stickers: meta.stickers, rarity: meta.rarity });
+        if (g) { g.qty++; g.assetids.push(a.assetid); }
+        else groups.set(gk, { name: meta.name, phase: meta.phase, paintIndex: meta.paintIndex, qty: 1, icon: meta.icon, stickers: meta.stickers, rarity: meta.rarity, assetids: [a.assetid] });
     }
     const uniqueNames = [...new Set([...groups.values()].map(g => g.name))];
 
@@ -742,7 +798,9 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
             priced += g.qty;
             const sm = stickerByGroup.get(gk);
             if (sm) stickerTotal += sm.value * g.qty;
-            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || undefined, hashName: g.name });
+            // Per-item float/seed only make sense for a single copy — attach them to singleton groups.
+            const ap = (g.qty === 1 && opts.assetProps) ? opts.assetProps.get(g.assetids[0]) : undefined;
+            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || undefined, hashName: g.name, float: ap?.float, seed: ap?.seed });
         }
         perItem.sort((a, b) => (b.price * b.qty) - (a.price * a.qty));
         const topItems = perItem.slice(0, 10).map(i => ({ name: i.qty > 1 ? `${i.name} ×${i.qty}` : i.name, price: i.price * i.qty, color: i.rarity }));
@@ -1488,6 +1546,13 @@ const BUTTON_CSS = `
 .vsi-modal-wear.ft { color: #facc15; background: rgba(250,204,21,.14); }
 .vsi-modal-wear.ww { color: #fb923c; background: rgba(251,146,60,.14); }
 .vsi-modal-wear.bs { color: #f87171; background: rgba(248,113,113,.14); }
+/* Real float + paint seed (own inventory, via webapi_token) */
+.vsi-modal-float {
+    font-size: 10px; font-weight: 700; flex: none; white-space: nowrap;
+    color: #8ab4f8; background: rgba(138,180,248,.12);
+    padding: 2px 6px; border-radius: 4px; font-variant-numeric: tabular-nums;
+}
+.vsi-modal-float .vsi-modal-seed { color: #9aa4b2; font-weight: 600; margin-left: 3px; }
 .vsi-modal-thumb {
     width: 44px; height: 34px; flex: none; object-fit: contain;
     background: rgba(255,255,255,.03); border-radius: 5px;
@@ -1640,7 +1705,9 @@ async function priceSteamId(steamId: string, name?: string, onBackgroundUpdate?:
         }
         : undefined;
 
-    const inv = await loadInventory(steamId, { source, useLiveFallback, onUpdate });
+    // Own-inventory floats/seeds (no-op for foreign profiles or without a token).
+    const assetProps = await fetchOwnAssetProps(steamId).catch(() => null);
+    const inv = await loadInventory(steamId, { source, useLiveFallback, assetProps: assetProps ?? undefined, onUpdate });
     if (inv.isPrivate) throw new Error("inventory-private");
     const snap = snapFrom(inv);
     const rk = await cachePushInventory(steamId, snap, name); // share to the read-through cache (best-effort)
@@ -2230,6 +2297,7 @@ async function openInventoryModal(steamId: string, displayName: string) {
                 <span class="vsi-modal-name">${escapeHtml(abbrevItem(i.name))}</span>
                 ${wearTag(i.name)}
                 ${stTag(i.name)}
+                ${i.float != null ? `<span class="vsi-modal-float" title="float / wear value${i.seed != null ? ` · paint seed ${i.seed}` : ""}">${i.float.toFixed(4)}${i.seed != null ? ` <span class="vsi-modal-seed">#${i.seed}</span>` : ""}</span>` : ""}
                 ${badge}
                 ${i.qty > 1 ? `<span class="vsi-modal-qty">×${i.qty}</span>` : ""}
                 <span class="vsi-modal-price">${fmt(i.price * i.qty, cur)}</span>
@@ -2385,6 +2453,13 @@ function buildSettingsPanel(): any {
             // Share your trade URL to the cache the moment you set it, so other addon users
             // see a Trade button on your profile right away.
             if (id === "tradeUrl" || id === "useSharedCache" || id === "shareTradeUrl") cachePushTradeUrl().catch(() => { /* best-effort */ });
+            // Paste a webapi_token → immediately re-price your own inventory so floats/seeds populate.
+            if (id === "steamWebApiToken" && typeof value === "string" && value.trim()) {
+                const sid = tokenSteamId(value.trim());
+                if (sid) priceSteamId(sid)
+                    .then(() => { try { BD.UI?.showToast?.("Floats loaded — open your inventory breakdown.", { type: "success" }); } catch { /* */ } })
+                    .catch(() => { try { BD.UI?.showToast?.("Couldn't load floats — token may be invalid or expired.", { type: "error" }); } catch { /* */ } });
+            }
             if (id === "resetHistory" && value === true) {
                 const n = clearAllHistory();
                 (settings.store as any).resetHistory = false;
