@@ -2,7 +2,7 @@
  * @name CS2Inventory
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.6.3
+ * @version 1.6.4
  * @source https://github.com/VisaHolder/cs2-inventory-betterdiscord
  * @website https://github.com/VisaHolder/cs2-inventory-betterdiscord
  */
@@ -314,6 +314,7 @@ var SelectedGuildStore;
 var SelectedChannelStore;
 var RestAPI;
 var MessageActions;
+var ComponentDispatch;
 try {
   UserStore = Webpack.getStore("UserStore");
 } catch {
@@ -336,6 +337,11 @@ try {
 }
 try {
   MessageActions = Webpack.getByKeys && Webpack.getByKeys("sendMessage", "editMessage") || Webpack.getModule((m) => typeof m?.sendMessage === "function" && typeof m?.editMessage === "function");
+} catch {
+}
+try {
+  const pick = (o) => o && typeof o.dispatchToLastSubscribed === "function" ? o : o?.ComponentDispatch && typeof o.ComponentDispatch.dispatchToLastSubscribed === "function" ? o.ComponentDispatch : null;
+  ComponentDispatch = Webpack.getByKeys && pick(Webpack.getByKeys("dispatchToLastSubscribed")) || Webpack.getByKeys && pick(Webpack.getByKeys("ComponentDispatch")) || pick(Webpack.getModule((m) => typeof m?.dispatchToLastSubscribed === "function")) || pick(Webpack.getModule((m) => m?.ComponentDispatch?.dispatchToLastSubscribed));
 } catch {
 }
 async function fetchJson(url, opts) {
@@ -578,7 +584,7 @@ var SETTINGS_SCHEMA = {
     options: [
       { label: "Open its Steam Market listing", value: "market", default: true },
       { label: "Inspect in-game (opens CS2)", value: "inspect" },
-      { label: "Find on CSFloat", value: "csfloat" },
+      { label: "Price on CSFloat", value: "csfloat" },
       { label: "Price on Buff163", value: "buff" },
       { label: "View in the owner's Steam inventory", value: "inventory" }
     ]
@@ -589,7 +595,7 @@ var SETTINGS_SCHEMA = {
     options: [
       { label: "Show a menu (pick per item)", value: "menu", default: true },
       { label: "Inspect in-game (opens CS2)", value: "inspect" },
-      { label: "Find on CSFloat", value: "csfloat" },
+      { label: "Price on CSFloat", value: "csfloat" },
       { label: "Price on Buff163", value: "buff" },
       { label: "View in the owner's Steam inventory", value: "inventory" },
       { label: "Open its Steam Market listing", value: "market" }
@@ -1817,6 +1823,7 @@ var BUTTON_CSS = `
 }
 .vsi-ctx-item { padding: 7px 10px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
 .vsi-ctx-item:hover { background: #5865f2; color: #fff; }
+.vsi-ctx-sep { height: 1px; margin: 4px 6px; background: rgba(255,255,255,.07); }
 /* Custom name tag */
 .vsi-modal-nametag { font-style: italic; color: #c8a2ff; font-weight: 500; }
 /* Type-filter chips */
@@ -2495,15 +2502,42 @@ function copyText(text) {
   return false;
 }
 var createTradeUrl = (ownerTradeUrl, assetid) => `${ownerTradeUrl}${ownerTradeUrl.includes("?") ? "&" : "?"}for_item=730_2_${assetid}`;
-function rowActions(i, ownerSteamId, ownerTradeUrl) {
+var csgostashUrl = (i) => `https://csgostash.com/search?q=${encodeURIComponent(hashNameOf(i))}`;
+var buildChatLine = (i, cur) => {
+  const parts = [abbrevItem(i.name)];
+  if (i.float != null) parts.push(`float ${i.float.toFixed(4)}`);
+  parts.push(fmt(i.price, cur));
+  return parts.join(" \xB7 ");
+};
+function postToChat(text) {
+  try {
+    const box = document.querySelector('[data-slate-editor="true"]');
+    if (box) {
+      box.focus();
+      if (document.execCommand("insertText", false, text)) return "insert";
+    }
+  } catch {
+  }
+  try {
+    if (ComponentDispatch?.dispatchToLastSubscribed) {
+      ComponentDispatch.dispatchToLastSubscribed("INSERT_TEXT", { plainText: text, rawText: text });
+      return "insert";
+    }
+  } catch {
+  }
+  return copyText(text) ? "copy" : "";
+}
+function rowActions(i, ownerSteamId, ownerTradeUrl, cur = 1) {
   const out = [];
-  if (ownerTradeUrl && i.assetid) out.push({ kind: "tradeoffer", label: "Create trade for this item", url: createTradeUrl(ownerTradeUrl, i.assetid) });
-  if (i.inspect) out.push({ kind: "inspect", label: "Inspect in-game", url: inspectUrl(i.inspect) });
-  if (i.inspect) out.push({ kind: "copyinspect", label: "Copy inspect link", copy: inspectLink(i.inspect) });
-  out.push({ kind: "csfloat", label: "Find on CSFloat", url: csfloatSearchUrl(i) });
-  out.push({ kind: "buff", label: "Price on Buff163", url: buffSearchUrl(i) });
-  if (i.assetid && ownerSteamId) out.push({ kind: "inventory", label: "View in owner's inventory", url: inventoryUrl(i.assetid, ownerSteamId) });
-  out.push({ kind: "market", label: "Steam Market page", url: steamMarketUrl(i) });
+  if (ownerTradeUrl && i.assetid) out.push({ kind: "tradeoffer", group: "trade", label: "Create trade for this item", url: createTradeUrl(ownerTradeUrl, i.assetid) });
+  if (i.inspect) out.push({ kind: "inspect", group: "inspect", label: "Inspect in-game", url: inspectUrl(i.inspect) });
+  if (i.inspect) out.push({ kind: "copyinspect", group: "inspect", label: "Copy inspect link", copy: inspectLink(i.inspect) });
+  out.push({ kind: "csfloat", group: "price", label: "Price on CSFloat", url: csfloatSearchUrl(i) });
+  out.push({ kind: "buff", group: "price", label: "Price on Buff163", url: buffSearchUrl(i) });
+  out.push({ kind: "market", group: "price", label: "Steam Market page", url: steamMarketUrl(i) });
+  out.push({ kind: "csgostash", group: "price", label: "Open on CSGOStash", url: csgostashUrl(i) });
+  if (i.assetid && ownerSteamId) out.push({ kind: "inventory", group: "more", label: "View in owner's inventory", url: inventoryUrl(i.assetid, ownerSteamId) });
+  out.push({ kind: "postchat", group: "more", label: "Post to chat", chat: buildChatLine(i, cur) });
   return out;
 }
 var actionUrlFor = (kind, i, ownerSteamId) => {
@@ -2543,7 +2577,7 @@ function openProtocol(url) {
 var clickActionLabel = (i) => {
   const a = settings.store.itemClickAction || "market";
   if (a === "inspect" && i.inspect) return "Inspect in-game";
-  if (a === "csfloat") return "Find on CSFloat";
+  if (a === "csfloat") return "Price on CSFloat";
   if (a === "buff") return "Price on Buff163";
   if (a === "inventory" && i.assetid) return "View in owner's inventory";
   return "Open on the Steam Community Market";
@@ -2570,7 +2604,13 @@ function showItemMenu(x, y, actions) {
   closeItemMenu();
   const m = document.createElement("div");
   m.className = "vsi-ctx";
-  m.innerHTML = actions.map((a) => a.copy != null ? `<div class="vsi-ctx-item" data-copy="${escapeHtml(a.copy)}">${escapeHtml(a.label)}</div>` : `<div class="vsi-ctx-item" data-url="${escapeHtml(a.url ?? "")}">${escapeHtml(a.label)}</div>`).join("");
+  let prevGroup = "";
+  m.innerHTML = actions.map((a) => {
+    const sep = prevGroup && a.group !== prevGroup ? '<div class="vsi-ctx-sep"></div>' : "";
+    prevGroup = a.group;
+    const attr = a.copy != null ? `data-copy="${escapeHtml(a.copy)}"` : a.chat != null ? `data-chat="${escapeHtml(a.chat)}"` : `data-url="${escapeHtml(a.url ?? "")}"`;
+    return `${sep}<div class="vsi-ctx-item" ${attr}>${escapeHtml(a.label)}</div>`;
+  }).join("");
   document.body.appendChild(m);
   _ctxMenuEl = m;
   const r = m.getBoundingClientRect();
@@ -2579,6 +2619,16 @@ function showItemMenu(x, y, actions) {
   m.addEventListener("click", (ev) => {
     const el = ev.target.closest?.(".vsi-ctx-item");
     if (!el) return;
+    if (el.dataset.chat != null) {
+      const text = el.dataset.chat;
+      closeInventoryModal();
+      const r2 = postToChat(text);
+      try {
+        if (r2) BD.UI?.showToast?.(r2 === "insert" ? "Added to your message box" : "Copied \u2014 paste into chat", { type: "success" });
+      } catch {
+      }
+      return;
+    }
     if (el.dataset.copy != null) {
       if (copyText(el.dataset.copy)) try {
         BD.UI?.showToast?.("Copied inspect link", { type: "success" });
@@ -2778,7 +2828,7 @@ async function openInventoryModal(steamId, displayName) {
     const i = row ? currentRows[+(row.dataset.i ?? -1)] : null;
     if (!i) return;
     e.preventDefault();
-    const acts = rowActions(i, steamId, ownerTradeUrl);
+    const acts = rowActions(i, steamId, ownerTradeUrl, cur);
     const mode = settings.store.rightClickAction || "menu";
     if (mode === "menu") {
       showItemMenu(e.clientX, e.clientY, acts);

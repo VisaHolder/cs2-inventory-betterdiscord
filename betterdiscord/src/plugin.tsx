@@ -18,7 +18,7 @@ const { Webpack } = BD;
 // Resolved defensively: a webpack lookup throwing (some Discord modules have
 // getters that throw when a filter touches them) must never stop the plugin
 // from loading. Anything that fails stays null and its feature degrades.
-let UserStore: any, UserProfileStore: any, SelectedGuildStore: any, SelectedChannelStore: any, RestAPI: any, MessageActions: any;
+let UserStore: any, UserProfileStore: any, SelectedGuildStore: any, SelectedChannelStore: any, RestAPI: any, MessageActions: any, ComponentDispatch: any;
 try { UserStore = Webpack.getStore("UserStore"); } catch { /* */ }
 try { UserProfileStore = Webpack.getStore("UserProfileStore"); } catch { /* */ }
 try { SelectedGuildStore = Webpack.getStore("SelectedGuildStore"); } catch { /* */ }
@@ -30,6 +30,17 @@ try {
 try {
     MessageActions = (Webpack.getByKeys && Webpack.getByKeys("sendMessage", "editMessage"))
         || Webpack.getModule((m: any) => typeof m?.sendMessage === "function" && typeof m?.editMessage === "function");
+} catch { /* */ }
+try {
+    // Used to insert text into the message box (the "Post to chat" row) so the user reviews & sends.
+    // The dispatcher exposes dispatchToLastSubscribed; it lives either as a top-level export or under
+    // a `.ComponentDispatch` key depending on the build — try both, plus a broad module scan.
+    const pick = (o: any) => (o && typeof o.dispatchToLastSubscribed === "function") ? o : (o?.ComponentDispatch && typeof o.ComponentDispatch.dispatchToLastSubscribed === "function" ? o.ComponentDispatch : null);
+    ComponentDispatch =
+        (Webpack.getByKeys && pick(Webpack.getByKeys("dispatchToLastSubscribed")))
+        || (Webpack.getByKeys && pick(Webpack.getByKeys("ComponentDispatch")))
+        || pick(Webpack.getModule((m: any) => typeof m?.dispatchToLastSubscribed === "function"))
+        || pick(Webpack.getModule((m: any) => m?.ComponentDispatch?.dispatchToLastSubscribed));
 } catch { /* */ }
 
 // ── External HTTP. BdApi.Net.fetch is CSP-free (like Vencord's native helper),
@@ -288,7 +299,7 @@ const SETTINGS_SCHEMA: Record<string, any> = {
         options: [
             { label: "Open its Steam Market listing", value: "market", default: true },
             { label: "Inspect in-game (opens CS2)", value: "inspect" },
-            { label: "Find on CSFloat", value: "csfloat" },
+            { label: "Price on CSFloat", value: "csfloat" },
             { label: "Price on Buff163", value: "buff" },
             { label: "View in the owner's Steam inventory", value: "inventory" },
         ],
@@ -299,7 +310,7 @@ const SETTINGS_SCHEMA: Record<string, any> = {
         options: [
             { label: "Show a menu (pick per item)", value: "menu", default: true },
             { label: "Inspect in-game (opens CS2)", value: "inspect" },
-            { label: "Find on CSFloat", value: "csfloat" },
+            { label: "Price on CSFloat", value: "csfloat" },
             { label: "Price on Buff163", value: "buff" },
             { label: "View in the owner's Steam inventory", value: "inventory" },
             { label: "Open its Steam Market listing", value: "market" },
@@ -1680,6 +1691,7 @@ const BUTTON_CSS = `
 }
 .vsi-ctx-item { padding: 7px 10px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
 .vsi-ctx-item:hover { background: #5865f2; color: #fff; }
+.vsi-ctx-sep { height: 1px; margin: 4px 6px; background: rgba(255,255,255,.07); }
 /* Custom name tag */
 .vsi-modal-nametag { font-style: italic; color: #c8a2ff; font-weight: 500; }
 /* Type-filter chips */
@@ -2469,18 +2481,48 @@ function copyText(text: string): boolean {
 const createTradeUrl = (ownerTradeUrl: string, assetid: string) =>
     `${ownerTradeUrl}${ownerTradeUrl.includes("?") ? "&" : "?"}for_item=730_2_${assetid}`;
 
-// Every action available for a row, in menu order. A `url` opens externally; a `copy` writes to the
-// clipboard. Kinds whose data is missing (no inspect payload / no assetid) are omitted.
-interface RowAction { kind: string; label: string; url?: string; copy?: string }
-function rowActions(i: PricedItem, ownerSteamId: string, ownerTradeUrl?: string | null): RowAction[] {
+// CSGOStash skin reference (all wears + prices, float caps, collection, pattern info). csgostash.com
+// now 301-redirects to stash.clash.gg, carrying the /search?q= path.
+const csgostashUrl = (i: PricedItem) => `https://csgostash.com/search?q=${encodeURIComponent(hashNameOf(i))}`;
+
+// One-line summary for the "Post to chat" row: name · float · price. (Kept short — the inspect
+// link, which is long, is its own "Copy inspect link" action.)
+const buildChatLine = (i: PricedItem, cur: number): string => {
+    const parts = [abbrevItem(i.name)];
+    if (i.float != null) parts.push(`float ${i.float.toFixed(4)}`);
+    parts.push(fmt(i.price, cur));
+    return parts.join(" · ");
+};
+// Drop text into the message box (user reviews & sends). Primary: focus the Slate editor and
+// execCommand("insertText") — the input events Slate listens for. Then the ComponentDispatch
+// INSERT_TEXT path, then clipboard as a last resort. Returns "insert" | "copy" | "".
+function postToChat(text: string): "insert" | "copy" | "" {
+    try {
+        const box = document.querySelector('[data-slate-editor="true"]') as HTMLElement | null;
+        if (box) {
+            box.focus();
+            if (document.execCommand("insertText", false, text)) return "insert";
+        }
+    } catch { /* */ }
+    try { if (ComponentDispatch?.dispatchToLastSubscribed) { ComponentDispatch.dispatchToLastSubscribed("INSERT_TEXT", { plainText: text, rawText: text }); return "insert"; } } catch { /* */ }
+    return copyText(text) ? "copy" : "";
+}
+
+// Every action available for a row, grouped for the menu (a divider is drawn between groups). A
+// `url` opens externally, `copy` writes to the clipboard, `chat` inserts into the message box.
+// Kinds whose data is missing (no inspect payload / no assetid) are omitted.
+interface RowAction { kind: string; label: string; group: string; url?: string; copy?: string; chat?: string }
+function rowActions(i: PricedItem, ownerSteamId: string, ownerTradeUrl?: string | null, cur = 1): RowAction[] {
     const out: RowAction[] = [];
-    if (ownerTradeUrl && i.assetid) out.push({ kind: "tradeoffer", label: "Create trade for this item", url: createTradeUrl(ownerTradeUrl, i.assetid) });
-    if (i.inspect) out.push({ kind: "inspect", label: "Inspect in-game", url: inspectUrl(i.inspect) });
-    if (i.inspect) out.push({ kind: "copyinspect", label: "Copy inspect link", copy: inspectLink(i.inspect) });
-    out.push({ kind: "csfloat", label: "Find on CSFloat", url: csfloatSearchUrl(i) });
-    out.push({ kind: "buff", label: "Price on Buff163", url: buffSearchUrl(i) });
-    if (i.assetid && ownerSteamId) out.push({ kind: "inventory", label: "View in owner's inventory", url: inventoryUrl(i.assetid, ownerSteamId) });
-    out.push({ kind: "market", label: "Steam Market page", url: steamMarketUrl(i) });
+    if (ownerTradeUrl && i.assetid) out.push({ kind: "tradeoffer", group: "trade", label: "Create trade for this item", url: createTradeUrl(ownerTradeUrl, i.assetid) });
+    if (i.inspect) out.push({ kind: "inspect", group: "inspect", label: "Inspect in-game", url: inspectUrl(i.inspect) });
+    if (i.inspect) out.push({ kind: "copyinspect", group: "inspect", label: "Copy inspect link", copy: inspectLink(i.inspect) });
+    out.push({ kind: "csfloat", group: "price", label: "Price on CSFloat", url: csfloatSearchUrl(i) });
+    out.push({ kind: "buff", group: "price", label: "Price on Buff163", url: buffSearchUrl(i) });
+    out.push({ kind: "market", group: "price", label: "Steam Market page", url: steamMarketUrl(i) });
+    out.push({ kind: "csgostash", group: "price", label: "Open on CSGOStash", url: csgostashUrl(i) });
+    if (i.assetid && ownerSteamId) out.push({ kind: "inventory", group: "more", label: "View in owner's inventory", url: inventoryUrl(i.assetid, ownerSteamId) });
+    out.push({ kind: "postchat", group: "more", label: "Post to chat", chat: buildChatLine(i, cur) });
     return out;
 }
 // Resolve a configured action kind to its URL for this item, falling back to Market when the
@@ -2503,7 +2545,7 @@ function openProtocol(url: string) {
 const clickActionLabel = (i: PricedItem): string => {
     const a = (settings.store.itemClickAction as string) || "market";
     if (a === "inspect" && i.inspect) return "Inspect in-game";
-    if (a === "csfloat") return "Find on CSFloat";
+    if (a === "csfloat") return "Price on CSFloat";
     if (a === "buff") return "Price on Buff163";
     if (a === "inventory" && i.assetid) return "View in owner's inventory";
     return "Open on the Steam Community Market";
@@ -2526,9 +2568,17 @@ function showItemMenu(x: number, y: number, actions: RowAction[]) {
     closeItemMenu();
     const m = document.createElement("div");
     m.className = "vsi-ctx";
-    m.innerHTML = actions.map(a => a.copy != null
-        ? `<div class="vsi-ctx-item" data-copy="${escapeHtml(a.copy)}">${escapeHtml(a.label)}</div>`
-        : `<div class="vsi-ctx-item" data-url="${escapeHtml(a.url ?? "")}">${escapeHtml(a.label)}</div>`).join("");
+    // Render each action, dropping a divider whenever the group changes — keeps the menu tidy
+    // (trade · inspect · prices · more) instead of one long undifferentiated list.
+    let prevGroup = "";
+    m.innerHTML = actions.map(a => {
+        const sep = (prevGroup && a.group !== prevGroup) ? "<div class=\"vsi-ctx-sep\"></div>" : "";
+        prevGroup = a.group;
+        const attr = a.copy != null ? `data-copy="${escapeHtml(a.copy)}"`
+            : a.chat != null ? `data-chat="${escapeHtml(a.chat)}"`
+            : `data-url="${escapeHtml(a.url ?? "")}"`;
+        return `${sep}<div class="vsi-ctx-item" ${attr}>${escapeHtml(a.label)}</div>`;
+    }).join("");
     document.body.appendChild(m);
     _ctxMenuEl = m;
     const r = m.getBoundingClientRect();
@@ -2537,6 +2587,14 @@ function showItemMenu(x: number, y: number, actions: RowAction[]) {
     m.addEventListener("click", ev => {
         const el = (ev.target as HTMLElement).closest?.(".vsi-ctx-item") as HTMLElement | null;
         if (!el) return;
+        if (el.dataset.chat != null) {
+            // Close the whole modal first so the message box is the active editor, then insert.
+            const text = el.dataset.chat;
+            closeInventoryModal();
+            const r2 = postToChat(text);
+            try { if (r2) BD.UI?.showToast?.(r2 === "insert" ? "Added to your message box" : "Copied — paste into chat", { type: "success" }); } catch { /* */ }
+            return;
+        }
         if (el.dataset.copy != null) { if (copyText(el.dataset.copy)) try { BD.UI?.showToast?.("Copied inspect link", { type: "success" }); } catch { /* */ } }
         else if (el.dataset.url) openProtocol(el.dataset.url);
         closeItemMenu();
@@ -2741,7 +2799,7 @@ async function openInventoryModal(steamId: string, displayName: string) {
         const i = row ? currentRows[+(row.dataset.i ?? -1)] : null;
         if (!i) return;
         e.preventDefault();
-        const acts = rowActions(i, steamId, ownerTradeUrl);
+        const acts = rowActions(i, steamId, ownerTradeUrl, cur);
         const mode = (settings.store.rightClickAction as string) || "menu";
         if (mode === "menu") { showItemMenu(e.clientX, e.clientY, acts); return; }
         const chosen = acts.find(a => a.kind === mode) ?? acts.find(a => a.kind === "market");
