@@ -982,7 +982,9 @@ function diffLineFromSnaps(snaps: ItemsSnapshot[]): string | null {
     // Best-effort price for a name, from the current run's priced items (for ordering the labels).
     const priceOf = (name: string): number => {
         let best = 0;
-        for (const it of cur.items) if (it.name === name || it.name.startsWith(name)) best = Math.max(best, it.price);
+        // Exact, or the phase-suffixed variant ("… (Ruby)") — the " (" guard avoids matching an
+        // unrelated longer name that merely shares this prefix.
+        for (const it of cur.items) if (it.name === name || it.name.startsWith(name + " (")) best = Math.max(best, it.price);
         return best;
     };
     const added: DiffEntry[] = [];
@@ -1891,8 +1893,9 @@ function sparklineSvg(values: number[], cur = 1): string {
 // the refresh update the card in place. No loop: a successful re-price stamps a fresh ts.
 function maybeAutoRefresh(card: HTMLElement, latest: Snapshot, shownUserId: string, isOwn: boolean) {
     if (!settings.store.autoRefreshStale || card.classList.contains("loading")) return;
-    const staleH = settings.store.snapshotStalenessHours || 6; // still auto-refresh even if the STALE display is off
-    if (Date.now() - latest.ts <= staleH * 3_600_000) return;
+    // 0 = "never mark stale" everywhere → also means never auto-refresh (nothing is stale).
+    const staleH = settings.store.snapshotStalenessHours ?? 24;
+    if (staleH <= 0 || Date.now() - latest.ts <= staleH * 3_600_000) return;
     refreshCard(card, shownUserId, isOwn).catch(() => { /* */ });
 }
 
@@ -2022,7 +2025,10 @@ function renderPricedCard(card: HTMLElement, latest: Snapshot, history: Snapshot
     let deltaHtml = "";
     if (settings.store.showPriceChange) {
         const minAgeMin = settings.store.deltaMinAgeMinutes || 1440;
-        const d = computeDelta(latest.total, history, minAgeMin * 60_000);
+        // Only diff against snapshots in the SAME currency — otherwise switching marketCurrency makes
+        // the chip show the FX gap (e.g. USD total vs an old EUR snapshot), not a real value change.
+        const sameCurHistory = history.filter(s => (s.currency || 1) === cur);
+        const d = computeDelta(latest.total, sameCurHistory, minAgeMin * 60_000);
         if (d) {
             const cls = d.delta > 0 ? "up" : d.delta < 0 ? "down" : "";
             const sign = d.delta >= 0 ? "+" : "";

@@ -1162,7 +1162,7 @@ function diffLineFromSnaps(snaps) {
   if (!cur.owned || !prev.owned) return null;
   const priceOf = (name) => {
     let best = 0;
-    for (const it of cur.items) if (it.name === name || it.name.startsWith(name)) best = Math.max(best, it.price);
+    for (const it of cur.items) if (it.name === name || it.name.startsWith(name + " (")) best = Math.max(best, it.price);
     return best;
   };
   const added = [];
@@ -2005,8 +2005,8 @@ function sparklineSvg(values, cur = 1) {
 }
 function maybeAutoRefresh(card, latest, shownUserId, isOwn) {
   if (!settings.store.autoRefreshStale || card.classList.contains("loading")) return;
-  const staleH = settings.store.snapshotStalenessHours || 6;
-  if (Date.now() - latest.ts <= staleH * 36e5) return;
+  const staleH = settings.store.snapshotStalenessHours ?? 24;
+  if (staleH <= 0 || Date.now() - latest.ts <= staleH * 36e5) return;
   refreshCard(card, shownUserId, isOwn).catch(() => {
   });
 }
@@ -2129,7 +2129,8 @@ function renderPricedCard(card, latest, history, changed) {
   let deltaHtml = "";
   if (settings.store.showPriceChange) {
     const minAgeMin = settings.store.deltaMinAgeMinutes || 1440;
-    const d = computeDelta(latest.total, history, minAgeMin * 6e4);
+    const sameCurHistory = history.filter((s) => (s.currency || 1) === cur);
+    const d = computeDelta(latest.total, sameCurHistory, minAgeMin * 6e4);
     if (d) {
       const cls = d.delta > 0 ? "up" : d.delta < 0 ? "down" : "";
       const sign = d.delta >= 0 ? "+" : "";
