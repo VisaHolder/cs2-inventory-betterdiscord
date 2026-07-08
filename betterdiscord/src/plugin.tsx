@@ -2416,12 +2416,12 @@ function itemHref(i: PricedItem, ownerSteamId: string): string {
     if (action === "inventory" && i.assetid && ownerSteamId) return `https://steamcommunity.com/profiles/${ownerSteamId}/inventory/#730_2_${i.assetid}`;
     return steamMarketUrl(i);
 }
-// Fire a steam:// (or any) protocol link reliably from JS (a synthetic anchor click, so the OS
-// handler runs even when window.open would be popup-blocked).
+// Open a steam:// (or http) URL via the OS handler. Discord's Electron swallows a plain anchor
+// click / window.open for custom protocols, so go through DiscordNative → Electron shell → anchor.
 function openProtocol(url: string) {
-    const a = document.createElement("a");
-    a.href = url; a.style.display = "none";
-    document.body.appendChild(a); a.click(); a.remove();
+    try { const dn = (window as any).DiscordNative; if (dn?.native?.openExternal) { dn.native.openExternal(url); return; } } catch { /* */ }
+    try { const sh = require("electron")?.shell; if (sh?.openExternal) { sh.openExternal(url); return; } } catch { /* */ }
+    try { const a = document.createElement("a"); a.href = url; a.style.display = "none"; document.body.appendChild(a); a.click(); a.remove(); } catch { /* */ }
 }
 const clickActionLabel = (i: PricedItem): string => {
     const a = (settings.store.itemClickAction as string) || "market";
@@ -2597,6 +2597,13 @@ async function openInventoryModal(steamId: string, displayName: string) {
         if (!ins) return;
         e.preventDefault();
         openProtocol(inspectUrl(ins));
+    });
+    // Left-click when the action is "inspect" → the row href is steam://; Discord won't open that
+    // from a normal anchor nav, so intercept and route it through openProtocol (http rows fall through).
+    listEl.addEventListener("click", e => {
+        const row = (e.target as HTMLElement)?.closest?.("a.vsi-modal-row") as HTMLAnchorElement | null;
+        const href = row?.getAttribute("href");
+        if (href && href.startsWith("steam://")) { e.preventDefault(); openProtocol(href); }
     });
     searchEl.addEventListener("input", () => { query = searchEl.value.trim().toLowerCase(); render(); });
     sortEl.addEventListener("click", () => {

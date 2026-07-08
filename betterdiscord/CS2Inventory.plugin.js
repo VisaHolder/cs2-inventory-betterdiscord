@@ -2,7 +2,7 @@
  * @name CS2Inventory
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.5.6
+ * @version 1.5.7
  * @source https://github.com/VisaHolder/cs2-inventory-betterdiscord
  * @website https://github.com/VisaHolder/cs2-inventory-betterdiscord
  */
@@ -2442,12 +2442,31 @@ function itemHref(i, ownerSteamId) {
   return steamMarketUrl(i);
 }
 function openProtocol(url) {
-  const a = document.createElement("a");
-  a.href = url;
-  a.style.display = "none";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  try {
+    const dn = window.DiscordNative;
+    if (dn?.native?.openExternal) {
+      dn.native.openExternal(url);
+      return;
+    }
+  } catch {
+  }
+  try {
+    const sh = require("electron")?.shell;
+    if (sh?.openExternal) {
+      sh.openExternal(url);
+      return;
+    }
+  } catch {
+  }
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } catch {
+  }
 }
 var clickActionLabel = (i) => {
   const a = settings.store.itemClickAction || "market";
@@ -2624,6 +2643,14 @@ async function openInventoryModal(steamId, displayName) {
     if (!ins) return;
     e.preventDefault();
     openProtocol(inspectUrl(ins));
+  });
+  listEl.addEventListener("click", (e) => {
+    const row = e.target?.closest?.("a.vsi-modal-row");
+    const href = row?.getAttribute("href");
+    if (href && href.startsWith("steam://")) {
+      e.preventDefault();
+      openProtocol(href);
+    }
   });
   searchEl.addEventListener("input", () => {
     query = searchEl.value.trim().toLowerCase();
