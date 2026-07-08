@@ -2593,13 +2593,16 @@ const createTradeUrl = (ownerTradeUrl: string, assetid: string) =>
 // now 301-redirects to stash.clash.gg, carrying the /search?q= path.
 const csgostashUrl = (i: PricedItem) => `https://csgostash.com/search?q=${encodeURIComponent(hashNameOf(i))}`;
 
-// One-line summary for the "Post to chat" row: name · float · price. (Kept short — the inspect
-// link, which is long, is its own "Copy inspect link" action.)
-const buildChatLine = (i: PricedItem, cur: number): string => {
+// One-line summary for the "Post to chat" row: name · float · price · link to the item in the
+// owner's Steam inventory (when we have the assetid — singletons — and their SteamID). The long
+// inspect link stays its own "Copy inspect link" action.
+const buildChatLine = (i: PricedItem, cur: number, ownerSteamId?: string): string => {
     const parts = [abbrevItem(i.name)];
     if (i.float != null) parts.push(`float ${i.float.toFixed(4)}`);
     parts.push(fmt(i.price, cur));
-    return parts.join(" · ");
+    let line = parts.join(" · ");
+    if (i.assetid && ownerSteamId) line += ` · ${inventoryUrl(i.assetid, ownerSteamId)}`;
+    return line;
 };
 // Post text to the current channel. Primary: send it straight through Discord's message API (the
 // same path /inventory uses to post publicly) — reliable, unlike execCommand insertText which the
@@ -2634,7 +2637,7 @@ function rowActions(i: PricedItem, ownerSteamId: string, ownerTradeUrl?: string 
     out.push({ kind: "market", group: "price", label: "Steam Market page", url: steamMarketUrl(i) });
     out.push({ kind: "csgostash", group: "price", label: "Open on CSGOStash", url: csgostashUrl(i) });
     if (i.assetid && ownerSteamId) out.push({ kind: "inventory", group: "more", label: "View in owner's inventory", url: inventoryUrl(i.assetid, ownerSteamId) });
-    out.push({ kind: "postchat", group: "more", label: "Post to chat", chat: buildChatLine(i, cur) });
+    out.push({ kind: "postchat", group: "more", label: "Post to chat", chat: buildChatLine(i, cur, ownerSteamId) });
     return out;
 }
 // Resolve a configured action kind to its URL for this item, falling back to Market when the

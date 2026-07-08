@@ -2,7 +2,7 @@
  * @name CS2Inventory
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.6.7
+ * @version 1.6.8
  * @source https://github.com/VisaHolder/cs2-inventory-betterdiscord
  * @website https://github.com/VisaHolder/cs2-inventory-betterdiscord
  */
@@ -2628,11 +2628,13 @@ function copyText(text) {
 }
 var createTradeUrl = (ownerTradeUrl, assetid) => `${ownerTradeUrl}${ownerTradeUrl.includes("?") ? "&" : "?"}for_item=730_2_${assetid}`;
 var csgostashUrl = (i) => `https://csgostash.com/search?q=${encodeURIComponent(hashNameOf(i))}`;
-var buildChatLine = (i, cur) => {
+var buildChatLine = (i, cur, ownerSteamId) => {
   const parts = [abbrevItem(i.name)];
   if (i.float != null) parts.push(`float ${i.float.toFixed(4)}`);
   parts.push(fmt(i.price, cur));
-  return parts.join(" \xB7 ");
+  let line = parts.join(" \xB7 ");
+  if (i.assetid && ownerSteamId) line += ` \xB7 ${inventoryUrl(i.assetid, ownerSteamId)}`;
+  return line;
 };
 function postToChat(text) {
   try {
@@ -2663,7 +2665,7 @@ function rowActions(i, ownerSteamId, ownerTradeUrl, cur = 1) {
   out.push({ kind: "market", group: "price", label: "Steam Market page", url: steamMarketUrl(i) });
   out.push({ kind: "csgostash", group: "price", label: "Open on CSGOStash", url: csgostashUrl(i) });
   if (i.assetid && ownerSteamId) out.push({ kind: "inventory", group: "more", label: "View in owner's inventory", url: inventoryUrl(i.assetid, ownerSteamId) });
-  out.push({ kind: "postchat", group: "more", label: "Post to chat", chat: buildChatLine(i, cur) });
+  out.push({ kind: "postchat", group: "more", label: "Post to chat", chat: buildChatLine(i, cur, ownerSteamId) });
   return out;
 }
 var actionUrlFor = (kind, i, ownerSteamId) => {
