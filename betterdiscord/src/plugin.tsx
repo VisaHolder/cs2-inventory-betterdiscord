@@ -529,7 +529,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 // One priced line in an inventory. `price` is the per-copy value INCLUDING applied stickers;
 // `stickerValue`/`stickerCount` break out the sticker portion (for the badge). `icon` is the
 // Steam icon_url hash; `qty` is how many identical (same skin + same stickers) copies.
-interface PricedItem { name: string; price: number; qty: number; icon?: string; stickerValue?: number; stickerCount?: number; rarity?: string; hashName?: string; float?: number; seed?: number; nametag?: string; catType?: string; inspect?: string; assetid?: string }
+interface PricedItem { name: string; price: number; qty: number; icon?: string; stickerValue?: number; stickerCount?: number; rarity?: string; hashName?: string; float?: number; seed?: number; nametag?: string; catType?: string; inspect?: string; assetid?: string; floatFlag?: "low" | "high" }
 
 interface InventoryResult {
     total: number;
@@ -590,7 +590,10 @@ interface PricingOptions {
 // specific prices then come from CSFloat's authenticated listings API (the user's
 // free API key); without a key we fall back to the generic blended price.
 interface PhaseInfo { phase: string; paintIndex: number }
+// One ByMykel fetch builds two maps: icon_url → Doppler phase, and skin name → {defindex,paintindex}
+// (the latter feeds the FloatDB low/high-float lookup, which is keyed by defindex:paintindex).
 let dopplerIconMap: Map<string, PhaseInfo> | null = null;
+let skinMetaByName: Map<string, { defindex: number; paintindex: number }> = new Map();
 let dopplerMapPromise: Promise<Map<string, PhaseInfo>> | null = null;
 async function getDopplerIconMap(): Promise<Map<string, PhaseInfo>> {
     if (dopplerIconMap) return dopplerIconMap;
@@ -600,12 +603,17 @@ async function getDopplerIconMap(): Promise<Map<string, PhaseInfo>> {
             try {
                 const skins: any[] = await fetchJson("https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/skins.json");
                 for (const s of skins) {
-                    if (!s?.phase || !s?.image || s?.paint_index == null) continue;
+                    const paintindex = s?.paint_index != null ? Number(s.paint_index) : null;
+                    const defindex = s?.weapon?.weapon_id != null ? Number(s.weapon.weapon_id) : null;
+                    if (typeof s?.name === "string" && defindex != null && paintindex != null && !skinMetaByName.has(s.name)) {
+                        skinMetaByName.set(s.name, { defindex, paintindex });
+                    }
+                    if (!s?.phase || !s?.image || paintindex == null) continue;
                     const hash = String(s.image).split("/economy/image/")[1]?.split("/")[0];
-                    if (hash) map.set(hash, { phase: s.phase, paintIndex: Number(s.paint_index) });
+                    if (hash) map.set(hash, { phase: s.phase, paintIndex: paintindex });
                 }
             } catch (e) {
-                console.warn("[VSI] Doppler phase map fetch failed — Dopplers will use generic prices", e);
+                console.warn("[VSI] ByMykel skin data fetch failed — Doppler phases & float ranks degrade", e);
             }
             dopplerIconMap = map;
             return map;
@@ -614,6 +622,57 @@ async function getDopplerIconMap(): Promise<Map<string, PhaseInfo>> {
     return dopplerMapPromise;
 }
 const isDopplerName = (name: string): boolean => /\bDoppler\b/i.test(name); // "Doppler" and "Gamma Doppler"
+
+// FloatDB rank thresholds: for each skin (defindex:paintindex:stattrak:souvenir) the float at/below
+// `low` is a ranked LOW-float and at/above `high` is a ranked HIGH-float. Public binary (~60KB),
+// cached ~6h. Lets us flag notable-float items locally from the float we already have — no per-item
+// inspect call needed, so it works for ANY inventory.
+interface FloatThreshold { low: number; high: number }
+let floatThresholds: Map<string, FloatThreshold> | null = null;
+let floatThresholdsAt = 0;
+let floatThresholdsPromise: Promise<Map<string, FloatThreshold>> | null = null;
+async function getFloatThresholds(): Promise<Map<string, FloatThreshold>> {
+    if (floatThresholds && Date.now() - floatThresholdsAt < 6 * 3_600_000) return floatThresholds;
+    if (!floatThresholdsPromise) {
+        floatThresholdsPromise = (async () => {
+            const map = new Map<string, FloatThreshold>();
+            try {
+                const res = await BD.Net.fetch("https://gateway.floatdb.com/v1/ranks/thresholds/bin");
+                if (res.ok) {
+                    const view = new DataView(await res.arrayBuffer());
+                    const entrySize = view.getUint8(1);
+                    const count = view.getUint16(2, true);
+                    for (let i = 0, off = 4; i < count; i++, off += entrySize) {
+                        const defindex = view.getUint16(off, true);
+                        const paintindex = view.getUint16(off + 2, true);
+                        const flags = view.getUint8(off + 4);
+                        map.set(`${defindex}:${paintindex}:${flags & 1}:${(flags >> 1) & 1}`, { low: view.getFloat32(off + 5, true), high: view.getFloat32(off + 9, true) });
+                    }
+                }
+            } catch (e) { console.warn("[VSI] FloatDB thresholds fetch failed — float-rank badges off", e); }
+            floatThresholds = map; floatThresholdsAt = Date.now();
+            return map;
+        })();
+    }
+    return floatThresholdsPromise;
+}
+// A ranked LOW / HIGH float flag for an item, or null. Needs its float + defindex/paintindex.
+function floatFlagFor(rawName: string, float: number | undefined, paintIndexOverride: number | null,
+    thresholds: Map<string, FloatThreshold>): "low" | "high" | null {
+    if (float == null) return null;
+    const base = rawName.replace(/^StatTrak™\s*/, "").replace(/^Souvenir\s*/, "").replace(/\s*\([^)]*\)\s*$/, "").trim();
+    const meta = skinMetaByName.get(base);
+    const defindex = meta?.defindex;
+    const paintindex = paintIndexOverride ?? meta?.paintindex;
+    if (defindex == null || paintindex == null) return null;
+    const st = /StatTrak™/.test(rawName) ? 1 : 0;
+    const souv = /^Souvenir /.test(rawName) ? 1 : 0;
+    const t = thresholds.get(`${defindex}:${paintindex}:${st}:${souv}`);
+    if (!t) return null;
+    if (float <= t.low) return "low";
+    if (float >= t.high) return "high";
+    return null;
+}
 
 // CSFloat authenticated phase-specific lowest price (USD → user currency). Cached like the bulk feed.
 // We filter by paint_index (the exact phase) — sorting the generic name by price would only ever
@@ -727,6 +786,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
     // We skip those entirely — otherwise we'd hit CSFloat/Steam for nothing and pad the "missing" list.
     // For Dopplers we also resolve the phase from the icon so a Ruby isn't priced as a Phase 3.
     const dopMap = await getDopplerIconMap();
+    const thresholds = await getFloatThresholds().catch(() => new Map()); // low/high-float rank cutoffs
     const wantStickers = settings.store.includeStickerValue === true; // strict opt-in; base value by default
     interface Meta { name: string; marketable: boolean; phase: string | null; paintIndex: number | null; icon: string; stickers: string[]; rarity: string; catType: string }
     const metaByKey = new Map<string, Meta>();
@@ -822,7 +882,8 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
             if (sm) stickerTotal += sm.value * g.qty;
             // Per-item float/seed/nametag only make sense for a single copy — attach to singleton groups.
             const ap = g.qty === 1 ? floatMap.get(g.assetids[0]) : undefined;
-            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || undefined, hashName: g.name, float: ap?.float, seed: ap?.seed, nametag: ap?.nametag, catType: g.catType, inspect: ap?.inspect, assetid: g.qty === 1 ? g.assetids[0] : undefined });
+            const floatFlag = ap?.float != null ? (floatFlagFor(g.name, ap.float, g.paintIndex, thresholds) ?? undefined) : undefined;
+            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || undefined, hashName: g.name, float: ap?.float, seed: ap?.seed, nametag: ap?.nametag, catType: g.catType, inspect: ap?.inspect, assetid: g.qty === 1 ? g.assetids[0] : undefined, floatFlag });
         }
         perItem.sort((a, b) => (b.price * b.qty) - (a.price * a.qty));
         const topItems = perItem.slice(0, 10).map(i => ({ name: i.qty > 1 ? `${i.name} ×${i.qty}` : i.name, price: i.price * i.qty, color: i.rarity }));
@@ -1573,12 +1634,17 @@ const BUTTON_CSS = `
 .vsi-modal-wear.ww { color: #fb923c; background: rgba(251,146,60,.14); }
 .vsi-modal-wear.bs { color: #f87171; background: rgba(248,113,113,.14); }
 /* Real float + paint seed (own inventory, via webapi_token) */
-.vsi-modal-float {
+/* float = blue pill, seed = purple pill — kept visually distinct so #seed can't read as part of the float */
+.vsi-modal-float, .vsi-modal-seed {
     font-size: 10px; font-weight: 700; flex: none; white-space: nowrap;
-    color: #8ab4f8; background: rgba(138,180,248,.12);
     padding: 2px 6px; border-radius: 4px; font-variant-numeric: tabular-nums;
 }
-.vsi-modal-float .vsi-modal-seed { color: #9aa4b2; font-weight: 600; margin-left: 3px; }
+.vsi-modal-float { color: #7fb0ff; background: rgba(90,150,255,.14); }
+.vsi-modal-seed { color: #c79bff; background: rgba(160,110,255,.15); }
+/* FloatDB low/high-float rank flag */
+.vsi-modal-frank { font-size: 9px; font-weight: 800; letter-spacing: .03em; flex: none; white-space: nowrap; padding: 2px 5px; border-radius: 4px; }
+.vsi-modal-frank.low { color: #ffe08a; background: rgba(230,184,0,.16); }
+.vsi-modal-frank.high { color: #9db4d0; background: rgba(120,150,190,.16); }
 /* Fade % and Blue Gem % chips (derived from the paint seed) */
 .vsi-modal-fade { font-size: 10px; font-weight: 800; flex: none; white-space: nowrap; padding: 2px 6px; border-radius: 4px; color: #ffb060; background: rgba(255,140,50,.15); }
 .vsi-modal-blue { font-size: 10px; font-weight: 800; flex: none; white-space: nowrap; padding: 2px 6px; border-radius: 4px; color: #6fb0ff; background: rgba(90,160,255,.17); }
@@ -2507,7 +2573,9 @@ async function openInventoryModal(steamId: string, displayName: string) {
                 <span class="vsi-modal-name">${escapeHtml(abbrevItem(i.name))}${i.nametag ? ` <span class="vsi-modal-nametag" title="Custom name tag">“${escapeHtml(i.nametag)}”</span>` : ""}</span>
                 ${wearTag(i.name)}
                 ${stTag(i.name)}
-                ${i.float != null ? `<span class="vsi-modal-float" title="float / wear value${i.seed != null ? ` · paint seed ${i.seed}` : ""}">${i.float.toFixed(4)}${i.seed != null ? ` <span class="vsi-modal-seed">#${i.seed}</span>` : ""}</span>` : ""}
+                ${i.float != null ? `<span class="vsi-modal-float" title="float / wear value">${i.float.toFixed(4)}</span>` : ""}
+                ${i.seed != null ? `<span class="vsi-modal-seed" title="paint seed / pattern">#${i.seed}</span>` : ""}
+                ${i.floatFlag ? `<span class="vsi-modal-frank ${i.floatFlag}" title="${i.floatFlag === "low" ? "Ranked low float — a top-tier low wear for this skin (FloatDB)" : "Ranked high float — a top-tier high wear for this skin (FloatDB)"}">${i.floatFlag === "low" ? "🥇 low float" : "high float"}</span>` : ""}
                 ${fadeBadge(i.name, i.seed)}
                 ${badge}
                 ${i.qty > 1 ? `<span class="vsi-modal-qty">×${i.qty}</span>` : ""}

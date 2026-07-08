@@ -39,6 +39,7 @@ Full guide: [`betterdiscord/README.md`](betterdiscord/README.md)
 - **Doppler / Gamma Doppler phase pricing** — Ruby, Sapphire, Black Pearl, Emerald, Phase 1-4 (with the optional CSFloat key)
 - **Real floats + paint seeds** — every skin's exact wear value and pattern index, on *any* public inventory, pulled straight from Steam (no login, no key)
 - **Fade % & Blue Gem %** — computed from the seed: 🔥 fade percentage on Fade / Amber / Acid skins, 💎 blue coverage on Case Hardened & Heat Treated
+- **Low-float / high-float flags** — 🥇 badges on ranked top-tier wears (FloatDB thresholds), on any inventory
 - **Full breakdown** — click any card for a searchable, sortable, type-filterable list of every item: thumbnails, real float + seed, color-graded wear (FN→BS), rarity colors, StatTrak™ / Souvenir tags, custom name tags, and one click through to each item's Steam Market page; right-click a user for the same
 - **Price history at a glance** — a sparkline with all-time-high / low markers, a gain/loss delta chip, and a value-milestone badge ($1K / $5K / $10K …)
 - **What changed** — each card shows items gained/dropped since last time
