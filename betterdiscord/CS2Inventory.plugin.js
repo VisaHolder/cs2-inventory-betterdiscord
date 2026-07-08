@@ -2,7 +2,7 @@
  * @name CS2Inventory
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.5.7
+ * @version 1.5.8
  * @source https://github.com/VisaHolder/cs2-inventory-betterdiscord
  * @website https://github.com/VisaHolder/cs2-inventory-betterdiscord
  */
@@ -1776,14 +1776,14 @@ var BUTTON_CSS = `
 .vsi-modal-wear.ft { color: #facc15; background: rgba(250,204,21,.14); }
 .vsi-modal-wear.ww { color: #fb923c; background: rgba(251,146,60,.14); }
 .vsi-modal-wear.bs { color: #f87171; background: rgba(248,113,113,.14); }
-/* Real float + paint seed (own inventory, via webapi_token) */
-/* float = blue pill, seed = purple pill \u2014 kept visually distinct so #seed can't read as part of the float */
-.vsi-modal-float, .vsi-modal-seed {
-    font-size: 10px; font-weight: 700; flex: none; white-space: nowrap;
-    padding: 2px 6px; border-radius: 4px; font-variant-numeric: tabular-nums;
-}
-.vsi-modal-float { color: #7fb0ff; background: rgba(90,150,255,.14); }
-.vsi-modal-seed { color: #c79bff; background: rgba(160,110,255,.15); }
+/* Quiet spec cluster: wear \xB7 float \xB7 seed grouped together as one tidy unit (kept subtle so the
+   colored highlight pills, not the routine numbers, are what catch the eye). */
+.vsi-modal-spec { display: inline-flex; align-items: center; gap: 7px; flex: none; }
+.vsi-modal-pills { display: inline-flex; align-items: center; gap: 5px; flex: none; }
+/* Real float + paint seed \u2014 plain muted mono text (no pill), the # prefix keeps the seed distinct. */
+.vsi-modal-float, .vsi-modal-seed { font-size: 11px; font-weight: 600; flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.vsi-modal-float { color: #99a9c4; }
+.vsi-modal-seed { color: #8f86b0; }
 /* FloatDB low/high-float rank flag */
 .vsi-modal-frank { font-size: 9px; font-weight: 800; letter-spacing: .03em; flex: none; white-space: nowrap; padding: 2px 5px; border-radius: 4px; }
 .vsi-modal-frank.low { color: #ffe08a; background: rgba(230,184,0,.16); }
@@ -2476,6 +2476,7 @@ var clickActionLabel = (i) => {
 };
 var rarityAccent = (rarity) => rarity && /^[0-9a-f]{3}([0-9a-f]{3})?$/i.test(rarity) ? ` style="border-left-color:#${rarity}"` : "";
 var stTag = (name) => /StatTrak™/.test(name) ? '<span class="vsi-modal-tag st">ST</span>' : /^Souvenir /.test(name) ? '<span class="vsi-modal-tag sv">SV</span>' : "";
+var modalName = (name) => name.replace(/StatTrak™\s*/g, "").replace(/Souvenir\s+/g, "").replace(/\s*\((?:Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)\s*$/i, "").replace(/★\s*/g, "\u2605 ").trim();
 var WEAR_TAGS = {
   "Factory New": ["FN", "fn"],
   "Minimal Wear": ["MW", "mw"],
@@ -2619,17 +2620,23 @@ async function openInventoryModal(steamId, displayName) {
     const rows = filtered.map((i) => {
       const sv = (i.stickerValue ?? 0) * i.qty;
       const badge = i.stickerCount ? `<span class="vsi-modal-sticker${sv >= 50 ? " grail" : ""}" title="${i.stickerCount} sticker${i.stickerCount > 1 ? "s" : ""}">+${fmt(sv, cur)}</span>` : "";
+      const pills = [
+        stTag(i.name),
+        fadeBadge(i.name, i.seed),
+        i.floatFlag ? `<span class="vsi-modal-frank ${i.floatFlag}" title="${i.floatFlag === "low" ? "Ranked low float for this skin (FloatDB)" : "Ranked high float for this skin (FloatDB)"}">${i.floatFlag === "low" ? "\u{1F947} low" : "high"}</span>` : "",
+        badge
+      ].filter(Boolean).join("");
+      const spec = [
+        wearTag(i.name),
+        i.float != null ? `<span class="vsi-modal-float" title="float / wear value">${i.float.toFixed(4)}</span>` : "",
+        i.seed != null && isPatternSkin(i.name) ? `<span class="vsi-modal-seed" title="paint seed / pattern">#${i.seed}</span>` : ""
+      ].filter(Boolean).join("");
       return `
             <a class="vsi-modal-row" href="${itemHref(i, steamId)}" target="_blank" rel="noopener noreferrer" title="${clickActionLabel(i)}${i.inspect ? " \xB7 right-click to inspect in-game" : ""}"${i.inspect ? ` data-inspect="${escapeHtml(i.inspect)}"` : ""}${rarityAccent(i.rarity)}>
                 ${i.icon ? `<img class="vsi-modal-thumb" src="${steamThumb(i.icon)}" loading="lazy" />` : '<div class="vsi-modal-thumb"></div>'}
-                <span class="vsi-modal-name">${escapeHtml(abbrevItem(i.name))}${i.nametag ? ` <span class="vsi-modal-nametag" title="Custom name tag">\u201C${escapeHtml(i.nametag)}\u201D</span>` : ""}</span>
-                ${wearTag(i.name)}
-                ${stTag(i.name)}
-                ${i.float != null ? `<span class="vsi-modal-float" title="float / wear value">${i.float.toFixed(4)}</span>` : ""}
-                ${i.seed != null && isPatternSkin(i.name) ? `<span class="vsi-modal-seed" title="paint seed / pattern">#${i.seed}</span>` : ""}
-                ${i.floatFlag ? `<span class="vsi-modal-frank ${i.floatFlag}" title="${i.floatFlag === "low" ? "Ranked low float \u2014 a top-tier low wear for this skin (FloatDB)" : "Ranked high float \u2014 a top-tier high wear for this skin (FloatDB)"}">${i.floatFlag === "low" ? "\u{1F947} low float" : "high float"}</span>` : ""}
-                ${fadeBadge(i.name, i.seed)}
-                ${badge}
+                <span class="vsi-modal-name">${escapeHtml(modalName(i.name))}${i.nametag ? ` <span class="vsi-modal-nametag" title="Custom name tag">\u201C${escapeHtml(i.nametag)}\u201D</span>` : ""}</span>
+                ${pills ? `<span class="vsi-modal-pills">${pills}</span>` : ""}
+                ${spec ? `<span class="vsi-modal-spec">${spec}</span>` : ""}
                 ${i.qty > 1 ? `<span class="vsi-modal-qty">\xD7${i.qty}</span>` : ""}
                 <span class="vsi-modal-price">${fmt(i.price * i.qty, cur)}</span>
                 <span class="vsi-modal-ext">\u2197</span>
