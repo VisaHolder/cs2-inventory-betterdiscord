@@ -566,6 +566,15 @@ var SETTINGS_SCHEMA = {
     description: "Show a value-milestone chip on the card ($1K / $5K / $10K \u2026).",
     default: true
   },
+  itemClickAction: {
+    type: OptionType.SELECT,
+    description: "What clicking an item in the breakdown does. (Right-click always offers Inspect in-game.) Inspect / owner-inventory need the item's data, which fills in after the profile is (re)priced.",
+    options: [
+      { label: "Open its Steam Market listing", value: "market", default: true },
+      { label: "Inspect in-game (opens CS2)", value: "inspect" },
+      { label: "View in the owner's Steam inventory", value: "inventory" }
+    ]
+  },
   compactCard: {
     type: OptionType.BOOLEAN,
     description: "Compact card \u2014 show just the total, delta, sparkline and meta line; hide the top-items list (still one click away in the full breakdown).",
@@ -903,7 +912,7 @@ async function loadInventory(steamId, opts) {
   const inv = { assets, descriptions };
   const floatMap = /* @__PURE__ */ new Map();
   for (const w of assetProps) {
-    let fl, sd, nt;
+    let fl, sd, nt, ins;
     for (const p of w.asset_properties ?? []) {
       const id = Number(p.propertyid);
       if (id === 2 && p.float_value != null) {
@@ -913,8 +922,9 @@ async function loadInventory(steamId, opts) {
         const v = Number(p.int_value);
         if (v >= 0 && v <= 1e3) sd = v;
       } else if (id === 5 && typeof p.string_value === "string" && p.string_value.trim()) nt = p.string_value.trim().slice(0, 60);
+      else if (id === 6 && typeof p.string_value === "string" && p.string_value.trim()) ins = p.string_value.trim();
     }
-    if (fl != null || sd != null || nt) floatMap.set(String(w.assetid), { float: fl, seed: sd, nametag: nt });
+    if (fl != null || sd != null || nt || ins) floatMap.set(String(w.assetid), { float: fl, seed: sd, nametag: nt, inspect: ins });
   }
   const dopMap = await getDopplerIconMap();
   const wantStickers = settings.store.includeStickerValue === true;
@@ -1004,7 +1014,7 @@ async function loadInventory(steamId, opts) {
       const sm = stickerByGroup.get(gk);
       if (sm) stickerTotal += sm.value * g.qty;
       const ap = g.qty === 1 ? floatMap.get(g.assetids[0]) : void 0;
-      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || void 0, hashName: g.name, float: ap?.float, seed: ap?.seed, nametag: ap?.nametag, catType: g.catType });
+      perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || void 0, hashName: g.name, float: ap?.float, seed: ap?.seed, nametag: ap?.nametag, catType: g.catType, inspect: ap?.inspect, assetid: g.qty === 1 ? g.assetids[0] : void 0 });
     }
     perItem.sort((a, b) => b.price * b.qty - a.price * a.qty);
     const topItems = perItem.slice(0, 10).map((i) => ({ name: i.qty > 1 ? `${i.name} \xD7${i.qty}` : i.name, price: i.price * i.qty, color: i.rarity }));
@@ -1410,7 +1420,9 @@ var BUTTON_CSS = `
     width: 100%;
     aspect-ratio: 240 / 30;
     height: auto;
-    margin: 2px 0 8px;
+    /* extra top/bottom margin so the endpoint + ATH/ATL dots (which overflow the box) don't crowd
+       the value row above or the meta line below */
+    margin: 7px 0 12px;
     overflow: visible;
 }
 .vsi-inv-card .vsi-meta {
@@ -2224,6 +2236,27 @@ function buildForeignRow(tradeUrl, steamId) {
 var steamThumb = (icon) => `https://community.akamai.steamstatic.com/economy/image/${icon}/48x48`;
 var stripToHashName = (name) => name.replace(/\s*×\d+\s*$/, "").replace(/\s*\((?:Phase [1-4]|Ruby|Sapphire|Black Pearl|Emerald)\)\s*$/i, "");
 var steamMarketUrl = (i) => `https://steamcommunity.com/market/listings/730/${encodeURIComponent(i.hashName ?? stripToHashName(i.name))}`;
+var inspectUrl = (payload) => `steam://run/730//+csgo_econ_action_preview%20${payload}`;
+function itemHref(i, ownerSteamId) {
+  const action = settings.store.itemClickAction || "market";
+  if (action === "inspect" && i.inspect) return inspectUrl(i.inspect);
+  if (action === "inventory" && i.assetid && ownerSteamId) return `https://steamcommunity.com/profiles/${ownerSteamId}/inventory/#730_2_${i.assetid}`;
+  return steamMarketUrl(i);
+}
+function openProtocol(url) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+var clickActionLabel = (i) => {
+  const a = settings.store.itemClickAction || "market";
+  if (a === "inspect" && i.inspect) return "Inspect in-game";
+  if (a === "inventory" && i.assetid) return "View in owner's inventory";
+  return "Open on the Steam Community Market";
+};
 var rarityAccent = (rarity) => rarity && /^[0-9a-f]{3}([0-9a-f]{3})?$/i.test(rarity) ? ` style="border-left-color:#${rarity}"` : "";
 var stTag = (name) => /StatTrak™/.test(name) ? '<span class="vsi-modal-tag st">ST</span>' : /^Souvenir /.test(name) ? '<span class="vsi-modal-tag sv">SV</span>' : "";
 var WEAR_TAGS = {
@@ -2368,7 +2401,7 @@ async function openInventoryModal(steamId, displayName) {
       const sv = (i.stickerValue ?? 0) * i.qty;
       const badge = i.stickerCount ? `<span class="vsi-modal-sticker${sv >= 50 ? " grail" : ""}" title="${i.stickerCount} sticker${i.stickerCount > 1 ? "s" : ""}">+${fmt(sv, cur)}</span>` : "";
       return `
-            <a class="vsi-modal-row" href="${steamMarketUrl(i)}" target="_blank" rel="noopener noreferrer" title="Open on the Steam Community Market"${rarityAccent(i.rarity)}>
+            <a class="vsi-modal-row" href="${itemHref(i, steamId)}" target="_blank" rel="noopener noreferrer" title="${clickActionLabel(i)}${i.inspect ? " \xB7 right-click to inspect in-game" : ""}"${i.inspect ? ` data-inspect="${escapeHtml(i.inspect)}"` : ""}${rarityAccent(i.rarity)}>
                 ${i.icon ? `<img class="vsi-modal-thumb" src="${steamThumb(i.icon)}" loading="lazy" />` : '<div class="vsi-modal-thumb"></div>'}
                 <span class="vsi-modal-name">${escapeHtml(abbrevItem(i.name))}${i.nametag ? ` <span class="vsi-modal-nametag" title="Custom name tag">\u201C${escapeHtml(i.nametag)}\u201D</span>` : ""}</span>
                 ${wearTag(i.name)}
@@ -2383,6 +2416,13 @@ async function openInventoryModal(steamId, displayName) {
     }).join("");
     listEl.innerHTML = (note ? `<div class="vsi-modal-empty">${escapeHtml(note)}</div>` : "") + rows;
   };
+  listEl.addEventListener("contextmenu", (e) => {
+    const row = e.target?.closest?.(".vsi-modal-row");
+    const ins = row?.dataset?.inspect;
+    if (!ins) return;
+    e.preventDefault();
+    openProtocol(inspectUrl(ins));
+  });
   searchEl.addEventListener("input", () => {
     query = searchEl.value.trim().toLowerCase();
     render();

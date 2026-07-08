@@ -276,6 +276,15 @@ const SETTINGS_SCHEMA: Record<string, any> = {
         description: "Show a value-milestone chip on the card ($1K / $5K / $10K …).",
         default: true,
     },
+    itemClickAction: {
+        type: OptionType.SELECT,
+        description: "What clicking an item in the breakdown does. (Right-click always offers Inspect in-game.) Inspect / owner-inventory need the item's data, which fills in after the profile is (re)priced.",
+        options: [
+            { label: "Open its Steam Market listing", value: "market", default: true },
+            { label: "Inspect in-game (opens CS2)", value: "inspect" },
+            { label: "View in the owner's Steam inventory", value: "inventory" },
+        ],
+    },
     compactCard: {
         type: OptionType.BOOLEAN,
         description: "Compact card — show just the total, delta, sparkline and meta line; hide the top-items list (still one click away in the full breakdown).",
@@ -509,7 +518,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 // One priced line in an inventory. `price` is the per-copy value INCLUDING applied stickers;
 // `stickerValue`/`stickerCount` break out the sticker portion (for the badge). `icon` is the
 // Steam icon_url hash; `qty` is how many identical (same skin + same stickers) copies.
-interface PricedItem { name: string; price: number; qty: number; icon?: string; stickerValue?: number; stickerCount?: number; rarity?: string; hashName?: string; float?: number; seed?: number; nametag?: string; catType?: string }
+interface PricedItem { name: string; price: number; qty: number; icon?: string; stickerValue?: number; stickerCount?: number; rarity?: string; hashName?: string; float?: number; seed?: number; nametag?: string; catType?: string; inspect?: string; assetid?: string }
 
 interface InventoryResult {
     total: number;
@@ -668,16 +677,17 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
 
     // Per-asset float (propertyid 2 "Wear Rating"), paint seed (1 "Pattern Template") and the custom
     // Name Tag (5) — all in Steam's public inventory response, available for ANY public inventory, no auth.
-    const floatMap = new Map<string, { float?: number; seed?: number; nametag?: string }>();
+    const floatMap = new Map<string, { float?: number; seed?: number; nametag?: string; inspect?: string }>();
     for (const w of assetProps) {
-        let fl: number | undefined, sd: number | undefined, nt: string | undefined;
+        let fl: number | undefined, sd: number | undefined, nt: string | undefined, ins: string | undefined;
         for (const p of (w.asset_properties ?? [])) {
             const id = Number(p.propertyid);
             if (id === 2 && p.float_value != null) { const v = Number(p.float_value); if (v >= 0 && v <= 1) fl = v; }
             else if (id === 1 && p.int_value != null) { const v = Number(p.int_value); if (v >= 0 && v <= 1000) sd = v; }
             else if (id === 5 && typeof p.string_value === "string" && p.string_value.trim()) nt = p.string_value.trim().slice(0, 60);
+            else if (id === 6 && typeof p.string_value === "string" && p.string_value.trim()) ins = p.string_value.trim(); // "Item Certificate" = inspect payload
         }
-        if (fl != null || sd != null || nt) floatMap.set(String(w.assetid), { float: fl, seed: sd, nametag: nt });
+        if (fl != null || sd != null || nt || ins) floatMap.set(String(w.assetid), { float: fl, seed: sd, nametag: nt, inspect: ins });
     }
 
     // Steam's `marketable` (0/1) tells us if the item can even be listed on the Market.
@@ -780,7 +790,7 @@ async function loadInventory(steamId: string, opts: PricingOptions): Promise<Inv
             if (sm) stickerTotal += sm.value * g.qty;
             // Per-item float/seed/nametag only make sense for a single copy — attach to singleton groups.
             const ap = g.qty === 1 ? floatMap.get(g.assetids[0]) : undefined;
-            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || undefined, hashName: g.name, float: ap?.float, seed: ap?.seed, nametag: ap?.nametag, catType: g.catType });
+            perItem.push({ name: g.phase ? `${g.name} (${g.phase})` : g.name, price: p, qty: g.qty, icon: g.icon, stickerValue: sm?.value, stickerCount: sm?.count, rarity: g.rarity || undefined, hashName: g.name, float: ap?.float, seed: ap?.seed, nametag: ap?.nametag, catType: g.catType, inspect: ap?.inspect, assetid: g.qty === 1 ? g.assetids[0] : undefined });
         }
         perItem.sort((a, b) => (b.price * b.qty) - (a.price * a.qty));
         const topItems = perItem.slice(0, 10).map(i => ({ name: i.qty > 1 ? `${i.name} ×${i.qty}` : i.name, price: i.price * i.qty, color: i.rarity }));
@@ -1261,7 +1271,9 @@ const BUTTON_CSS = `
     width: 100%;
     aspect-ratio: 240 / 30;
     height: auto;
-    margin: 2px 0 8px;
+    /* extra top/bottom margin so the endpoint + ATH/ATL dots (which overflow the box) don't crowd
+       the value row above or the meta line below */
+    margin: 7px 0 12px;
     overflow: visible;
 }
 .vsi-inv-card .vsi-meta {
@@ -2205,6 +2217,29 @@ const stripToHashName = (name: string) =>
     name.replace(/\s*×\d+\s*$/, "").replace(/\s*\((?:Phase [1-4]|Ruby|Sapphire|Black Pearl|Emerald)\)\s*$/i, "");
 const steamMarketUrl = (i: PricedItem) =>
     `https://steamcommunity.com/market/listings/730/${encodeURIComponent(i.hashName ?? stripToHashName(i.name))}`;
+// steam:// deep-link that opens CS2 and inspects the exact item (from asset property 6).
+const inspectUrl = (payload: string) => `steam://run/730//+csgo_econ_action_preview%20${payload}`;
+// Where a row click goes, per the itemClickAction setting; falls back to Market when the chosen
+// target's data (inspect payload / assetid) isn't available for this item.
+function itemHref(i: PricedItem, ownerSteamId: string): string {
+    const action = (settings.store.itemClickAction as string) || "market";
+    if (action === "inspect" && i.inspect) return inspectUrl(i.inspect);
+    if (action === "inventory" && i.assetid && ownerSteamId) return `https://steamcommunity.com/profiles/${ownerSteamId}/inventory/#730_2_${i.assetid}`;
+    return steamMarketUrl(i);
+}
+// Fire a steam:// (or any) protocol link reliably from JS (a synthetic anchor click, so the OS
+// handler runs even when window.open would be popup-blocked).
+function openProtocol(url: string) {
+    const a = document.createElement("a");
+    a.href = url; a.style.display = "none";
+    document.body.appendChild(a); a.click(); a.remove();
+}
+const clickActionLabel = (i: PricedItem): string => {
+    const a = (settings.store.itemClickAction as string) || "market";
+    if (a === "inspect" && i.inspect) return "Inspect in-game";
+    if (a === "inventory" && i.assetid) return "View in owner's inventory";
+    return "Open on the Steam Community Market";
+};
 const rarityAccent = (rarity?: string) =>
     rarity && /^[0-9a-f]{3}([0-9a-f]{3})?$/i.test(rarity) ? ` style="border-left-color:#${rarity}"` : "";
 // StatTrak / Souvenir tag from the raw market name.
@@ -2344,7 +2379,7 @@ async function openInventoryModal(steamId: string, displayName: string) {
                 ? `<span class="vsi-modal-sticker${sv >= 50 ? " grail" : ""}" title="${i.stickerCount} sticker${i.stickerCount > 1 ? "s" : ""}">+${fmt(sv, cur)}</span>`
                 : "";
             return `
-            <a class="vsi-modal-row" href="${steamMarketUrl(i)}" target="_blank" rel="noopener noreferrer" title="Open on the Steam Community Market"${rarityAccent(i.rarity)}>
+            <a class="vsi-modal-row" href="${itemHref(i, steamId)}" target="_blank" rel="noopener noreferrer" title="${clickActionLabel(i)}${i.inspect ? " · right-click to inspect in-game" : ""}"${i.inspect ? ` data-inspect="${escapeHtml(i.inspect)}"` : ""}${rarityAccent(i.rarity)}>
                 ${i.icon ? `<img class="vsi-modal-thumb" src="${steamThumb(i.icon)}" loading="lazy" />` : "<div class=\"vsi-modal-thumb\"></div>"}
                 <span class="vsi-modal-name">${escapeHtml(abbrevItem(i.name))}${i.nametag ? ` <span class="vsi-modal-nametag" title="Custom name tag">“${escapeHtml(i.nametag)}”</span>` : ""}</span>
                 ${wearTag(i.name)}
@@ -2360,6 +2395,14 @@ async function openInventoryModal(steamId: string, displayName: string) {
         listEl.innerHTML = (note ? `<div class="vsi-modal-empty">${escapeHtml(note)}</div>` : "") + rows;
     };
 
+    // Right-click a row → inspect that exact item in-game (if we have its inspect payload).
+    listEl.addEventListener("contextmenu", e => {
+        const row = (e.target as HTMLElement)?.closest?.(".vsi-modal-row") as HTMLElement | null;
+        const ins = row?.dataset?.inspect;
+        if (!ins) return;
+        e.preventDefault();
+        openProtocol(inspectUrl(ins));
+    });
     searchEl.addEventListener("input", () => { query = searchEl.value.trim().toLowerCase(); render(); });
     sortEl.addEventListener("click", () => {
         sortMode = sortMode === "value" ? "name" : "value";
