@@ -2,7 +2,7 @@
  * @name CS2Inventory
  * @author VisaHolder
  * @description CS2 inventory value on Discord profile popouts — Doppler/Gamma phase pricing (CSFloat), FX-converted prices, and Trade Offer / Steam buttons.
- * @version 1.7.2
+ * @version 1.7.3
  * @source https://github.com/VisaHolder/cs2-inventory-betterdiscord
  * @website https://github.com/VisaHolder/cs2-inventory-betterdiscord
  */
@@ -3652,11 +3652,17 @@ module.exports = class CS2Inventory {
     }
     try {
       const panel = buildSettingsPanel();
-      if (panel instanceof Node) wrap.appendChild(panel);
-      else if (panel) {
+      if (panel instanceof Node) {
+        wrap.appendChild(panel);
+        return wrap;
+      }
+      if (panel) {
         const mount = document.createElement("div");
         wrap.appendChild(mount);
-        BD.ReactDOM?.render(panel, mount);
+        const RD = BD.ReactDOM ?? globalThis.BdApi?.ReactDOM;
+        if (typeof RD?.createRoot === "function") RD.createRoot(mount).render(panel);
+        else if (typeof RD?.render === "function") RD.render(panel, mount);
+        else return panel;
       }
     } catch (e) {
       console.error("[VSI] settings panel", e);

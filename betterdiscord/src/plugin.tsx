@@ -3587,8 +3587,19 @@ module.exports = class CS2Inventory {
         try { wrap.appendChild(buildAboutSection()); } catch (e) { console.error("[VSI] about", e); }
         try {
             const panel = buildSettingsPanel();
-            if (panel instanceof Node) wrap.appendChild(panel);
-            else if (panel) { const mount = document.createElement("div"); wrap.appendChild(mount); BD.ReactDOM?.render(panel, mount); }
+            if (panel instanceof Node) { wrap.appendChild(panel); return wrap; }
+            if (panel) {
+                // buildSettingsPanel returns a React element. Mount it — but Discord/BD moved to
+                // React 18, where ReactDOM.render is GONE (replaced by createRoot). The old
+                // `BD.ReactDOM?.render` path silently no-ops there → the whole panel vanishes with
+                // no error. Handle both: createRoot (18) first, then legacy render (17).
+                const mount = document.createElement("div");
+                wrap.appendChild(mount);
+                const RD: any = (BD as any).ReactDOM ?? (globalThis as any).BdApi?.ReactDOM;
+                if (typeof RD?.createRoot === "function") RD.createRoot(mount).render(panel);
+                else if (typeof RD?.render === "function") RD.render(panel, mount);
+                else return panel; // last resort: let BD render it itself (drops the about block, but shows the settings)
+            }
         } catch (e) { console.error("[VSI] settings panel", e); }
         return wrap;
     }
